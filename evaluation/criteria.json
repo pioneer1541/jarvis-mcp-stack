@@ -1,0 +1,12 @@
+{
+  "thresholds": {
+    "route_accuracy_min": 0.98,
+    "helpful_rate_min": 1.0,
+    "finance_evidence_rate_min": 1.0
+  },
+  "notes": [
+    "Route accuracy uses _debug_pick_route_for_text for deterministic routing checks.",
+    "Helpful rate treats clarify/fallback/no-info style answers as fail.",
+    "Finance evidence rate checks route + numeric evidence in final_text/meta."
+  ]
+}

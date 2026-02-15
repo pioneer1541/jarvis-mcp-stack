@@ -1,0 +1,3465 @@
+def _news__format_voice_miniflux(items: list, limit: int = 5) -> str:
+    """
+    Voice-friendly news lines:
+    - No URL
+    - Short snippet
+    - Keep source + published time when available
+    """
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 5
+    if lim < 1:
+        lim = 1
+    if lim > 10:
+        lim = 10
+
+    it = items or []
+    if (not isinstance(it, list)) or (len(it) == 0):
+        return ""
+
+    out = []
+    idx = 1
+    for x in it:
+        if idx > lim:
+            break
+        if not isinstance(x, dict):
+            continue
+        title = str(x.get("title") or "").strip()
+        if not title:
+            continue
+
+        src = str(x.get("source") or "").strip()
+        pa = str(x.get("published_at") or "").strip()
+        sn = str(x.get("snippet") or "").strip()
+
+        # tighten snippet for TTS
+        if len(sn) > 90:
+            sn = sn[:90].rstrip() + "…"
+
+        line = str(idx) + ") " + title
+        meta = []
+        if src:
+            meta.append(src)
+        if pa:
+            meta.append(pa)
+        if meta:
+            line = line + "（" + " | ".join(meta) + "）"
+        out.append(line)
+        if sn:
+            out.append("   " + sn)
+        idx += 1
+
+    return "\n".join(out).strip()
+
+
+import os
+import re
+import html
+import unicodedata
+import json
+from datetime import datetime, timedelta, date
+from datetime import date as dt_date
+
+from typing import Any, Dict, List, Optional
+
+
+from zoneinfo import ZoneInfo
+import requests
+import uvicorn
+from starlette.applications import Starlette
+from starlette.routing import Mount
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+
+def _ug_clean_unicode(text: str) -> str:
+    if not text:
+        return ""
+    # Normalize
+    text = unicodedata.normalize("NFKC", text)
+    # Drop "format" chars (zero-width etc.)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    # Replace weird spaces
+    for cp in [0x00A0, 0x202F, 0x2007, 0x2009, 0x200A]:
+        text = text.replace(chr(cp), " ")
+    # Remove BOM
+    text = text.replace(chr(0xFEFF), "")
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _ug_extract_readable_text(html_text: str) -> str:
+    """
+    Lightweight extractor: title + meta description + main/article text, then strip tags.
+    Finally apply Unicode cleanup so the output is readable for voice/LLM.
+    """
+    try:
+        t = html_text or ""
+
+        # title
+        title = ""
+        m1 = re.search(r"(?is)<title[^>]*>(.*?)</title>", t)
+        if m1:
+            title = html.unescape(m1.group(1)).strip()
+
+        # meta description
+        desc = ""
+        m2 = re.search(
+            r'(?is)<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+            t,
+        )
+        if m2:
+            desc = html.unescape(m2.group(1)).strip()
+
+        # prefer main/article
+        body_html = ""
+        m3 = re.search(r"(?is)<main[^>]*>(.*?)</main>", t)
+        if m3:
+            body_html = m3.group(1)
+        else:
+            m4 = re.search(r"(?is)<article[^>]*>(.*?)</article>", t)
+            if m4:
+                body_html = m4.group(1)
+            else:
+                body_html = t
+
+        # drop script/style/noscript
+        body_html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", body_html)
+
+        # strip tags
+        body_text = re.sub(r"(?is)<[^>]+>", " ", body_html)
+
+        parts: List[str] = []
+        if title:
+            parts.append(title)
+        if desc and (desc not in title):
+            parts.append(desc)
+        if body_text:
+            parts.append(body_text)
+
+        out = "\n".join(parts)
+        out = html.unescape(out)
+        out = re.sub(r"[\r\t]+", " ", out)
+        out = re.sub(r"[ ]{2,}", " ", out)
+        out = re.sub(r"\n[ ]+", "\n", out)
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
+
+        out = _ug_clean_unicode(out)
+        return out
+    except Exception:
+        return _ug_clean_unicode((html_text or "").strip())
+
+
+def _ug_open_url_fetch(url: str, max_chars: int = 4000, timeout_sec: int = 10, accept_language: str = "") -> dict:
+    """
+    Fetch URL (HTML) and return extracted readable text excerpt.
+    Keep it robust: only requests, no heavy deps.
+    """
+    u = (url or "").strip()
+    if not u:
+        return {"ok": False, "error": "empty_url"}
+
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return {"ok": False, "error": "invalid_scheme", "hint": "Only http/https is allowed."}
+
+    # Clamp max_chars
+    try:
+        mc = int(max_chars)
+    except Exception:
+        mc = 4000
+    if mc < 200:
+        mc = 200
+    if mc > 12000:
+        mc = 12000
+
+    headers = {
+        "User-Agent": "mcp-tools/1.0 (+homeassistant)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    al = str(accept_language or "").strip()
+    if al:
+        headers["Accept-Language"] = al
+
+    try:
+        r = requests.get(u, headers=headers, timeout=float(timeout_sec), stream=True, allow_redirects=True)
+        status_code = int(getattr(r, "status_code", 0) or 0)
+        ct = (r.headers.get("content-type") or "").lower()
+
+        # Limit download size
+        max_bytes = 1500000  # 1.5MB
+        buf = b""
+        for chunk in r.iter_content(chunk_size=32768):
+            if not chunk:
+                continue
+            buf += chunk
+            if len(buf) > max_bytes:
+                break
+
+        enc = r.encoding or "utf-8"
+        try:
+            page = buf.decode(enc, errors="ignore")
+        except Exception:
+            page = buf.decode("utf-8", errors="ignore")
+
+        excerpt = _ug_extract_readable_text(page)
+        excerpt = excerpt[:mc]
+
+        title = ""
+        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", page or "")
+        if m:
+            title = _ug_clean_unicode(html.unescape(m.group(1)))
+
+        return {
+            "ok": True,
+            "url": u,
+            "final_url": str(getattr(r, "url", "") or ""),
+            "status_code": status_code,
+            "content_type": ct,
+            "title": title,
+            "excerpt": excerpt,
+        }
+    except Exception as e:
+        return {"ok": False, "url": u, "error": "fetch_failed", "message": str(e)}
+
+
+# ---- Transport security (keep what you already validated) ----
+_allowed_hosts = [
+    "localhost",
+    "localhost:*",
+    "127.0.0.1",
+    "127.0.0.1:*",
+    "192.168.1.162",
+    "192.168.1.162:*",
+    "192.168.1.162:19090",
+    "homeassistant",
+    "homeassistant:*",
+    "homeassistant.local",
+    "homeassistant.local:*",
+]
+
+_allowed_origins = [
+    "http://localhost",
+    "http://localhost:*",
+    "http://127.0.0.1",
+    "http://127.0.0.1:*",
+    "http://192.168.1.162",
+    "http://192.168.1.162:*",
+]
+
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=_allowed_hosts,
+    allowed_origins=_allowed_origins,
+)
+
+mcp = FastMCP("mcp-hello", transport_security=transport_security)
+
+
+@mcp.tool(description="(Test tool) Say hello. Use this when the user asks to test MCP tools or connectivity.")
+def hello(name: str = "world") -> dict:
+    return {"ok": True, "text": "Hello, " + str(name) + "!"}
+
+
+@mcp.tool(description="(Test tool) Simple ping for connectivity checks.")
+def ping() -> dict:
+    return {"ok": True, "pong": True}
+
+
+# ---- HA REST API helpers (optional; used for Structured / Live tools) ----
+# Configure via env:
+#   HA_BASE_URL (default http://homeassistant:8123)
+#   HA_TOKEN (required)
+#
+# Note: These tools are meant to provide *structured* data. They do NOT browse the public internet.
+
+def _ha_base_url() -> str:
+    u = str(os.getenv("HA_BASE_URL", "") or "").strip()
+    if not u:
+        u = "http://homeassistant:8123"
+    return u.rstrip("/")
+
+
+def _ha_headers() -> Dict[str, str]:
+    tok = str(os.getenv("HA_TOKEN", "") or "").strip()
+    if not tok:
+        return {}
+    return {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+
+
+def _ha_request(method: str, path: str, json_body: Any = None, timeout_sec: int = 10) -> dict:
+    base = _ha_base_url()
+    url = base + path
+    headers = _ha_headers()
+    if not headers:
+        return {"ok": False, "error": "ha_token_missing", "hint": "Set HA_TOKEN env var for HA REST API access."}
+
+    try:
+        if method.upper() == "GET":
+            r = requests.get(url, headers=headers, timeout=float(timeout_sec))
+        else:
+            r = requests.request(method.upper(), url, headers=headers, json=json_body, timeout=float(timeout_sec))
+        status = int(getattr(r, "status_code", 0) or 0)
+        try:
+            data = r.json()
+        except Exception:
+            data = (r.text or "")
+        if status >= 200 and status < 300:
+            return {"ok": True, "status_code": status, "data": data}
+        return {"ok": False, "status_code": status, "data": data, "error": "ha_http_error"}
+    except Exception as e:
+        return {"ok": False, "error": "ha_request_failed", "message": str(e), "url": url}
+
+
+@mcp.tool(description="(Structured) Get Home Assistant state for a specific entity_id via HA REST API.")
+def ha_get_state(entity_id: str, timeout_sec: int = 10) -> dict:
+    eid = str(entity_id or "").strip()
+    if not eid:
+        return {"ok": False, "error": "empty_entity_id"}
+    return _ha_request("GET", "/api/states/" + eid, timeout_sec=int(timeout_sec))
+
+
+@mcp.tool(description="(Structured) Call a Home Assistant service via HA REST API.")
+def ha_call_service(domain: str, service: str, service_data: Optional[dict] = None, return_response: bool = False, timeout_sec: int = 10) -> dict:
+    d = str(domain or "").strip()
+    s = str(service or "").strip()
+    if (not d) or (not s):
+        return {"ok": False, "error": "empty_domain_or_service"}
+    body = service_data if isinstance(service_data, dict) else {}
+    path = "/api/services/" + d + "/" + s
+    if bool(return_response):
+        path = path + "?return_response"
+    return _ha_request("POST", path, json_body=body, timeout_sec=int(timeout_sec))
+
+@mcp.tool(description="(Structured) Get forecast for a HA weather entity using weather.get_forecasts service.")
+def ha_weather_forecast(entity_id: str, forecast_type: str = "daily", timeout_sec: int = 12) -> dict:
+    eid = str(entity_id or "").strip()
+    ftype = str(forecast_type or "daily").strip().lower()
+    if not eid:
+        return {"ok": False, "error": "empty_entity_id"}
+    if ftype not in ("daily", "hourly", "twice_daily"):
+        ftype = "daily"
+
+    body = {"entity_id": eid, "type": ftype}
+    r = ha_call_service("weather", "get_forecasts", service_data=body, return_response=True, timeout_sec=int(timeout_sec))
+    if not r.get("ok"):
+        return r
+
+    data = r.get("data") or {}
+    sr = data.get("service_response") or {}
+    ent = sr.get(eid) or {}
+    fc = ent.get("forecast") or []
+    if not isinstance(fc, list):
+        fc = []
+
+    return {
+        "ok": True,
+        "status_code": r.get("status_code"),
+        "entity_id": eid,
+        "forecast_type": ftype,
+        "count": len(fc),
+        "forecast": fc,
+    }
+
+@mcp.tool(description="(Structured) List available HA calendars (entity_id + name).")
+def ha_list_calendars(timeout_sec: int = 12) -> dict:
+    return _ha_request("GET", "/api/calendars", timeout_sec=int(timeout_sec))
+
+
+@mcp.tool(description="(Structured) List events for a HA calendar entity. Dates are ISO 8601, e.g. 2026-01-22T00:00:00+11:00")
+def ha_calendar_events(entity_id: str, start: str, end: str, timeout_sec: int = 12) -> dict:
+    eid = str(entity_id or "").strip()
+    if not eid:
+        return {"ok": False, "error": "empty_entity_id"}
+    s = str(start or "").strip()
+    e = str(end or "").strip()
+    if (not s) or (not e):
+        return {"ok": False, "error": "empty_start_or_end", "hint": "Provide start/end ISO strings."}
+    path = "/api/calendars/" + eid + "?start=" + requests.utils.quote(s) + "&end=" + requests.utils.quote(e)
+    return _ha_request("GET", path, timeout_sec=int(timeout_sec))
+
+
+# ---- Public holidays (offline / deterministic) ----
+@mcp.tool(description="(Structured) Public holidays for Victoria, Australia. Uses python 'holidays' if available; otherwise returns an error.")
+def holiday_vic(year: int, timeout_sec: int = 3) -> dict:
+    y = year
+    try:
+        y = int(year)
+    except Exception:
+        y = int(datetime.now().year)
+    try:
+        import holidays  # type: ignore
+    except Exception:
+        return {
+            "ok": False,
+            "error": "holidays_lib_missing",
+            "hint": "Install python package 'holidays' in this container to enable holiday_vic().",
+        }
+
+    try:
+        # 'Australia' supports subdiv; VIC is Victoria.
+        try:
+            h = holidays.Australia(years=[y], subdiv="VIC")  # type: ignore
+        except Exception:
+            h = holidays.country_holidays("AU", years=[y], subdiv="VIC")  # type: ignore
+
+        items = []
+        for d, name in sorted(h.items()):
+            items.append({"date": str(d), "name": str(name)})
+        return {"ok": True, "year": y, "region": "AU-VIC", "holidays": items}
+    except Exception as e:
+        return {"ok": False, "error": "holiday_compute_failed", "message": str(e)}
+
+
+
+
+# --- RANGE_PARSE_HELPERS_V1 BEGIN ---
+def _parse_ymd(s: str):
+    ss = (s or "").strip()
+    if len(ss) != 10:
+        return None
+    try:
+        y = int(ss[0:4]); m = int(ss[5:7]); d = int(ss[8:10])
+        return dt_date(y, m, d)
+    except Exception:
+        return None
+
+
+def _cn_date_to_ymd(text: str, now_d):
+    """
+    Parse Chinese '1月26日' / '1月26号' into dt_date(year, month, day)
+    If year missing, use now_d.year.
+    """
+    t = (text or "").strip()
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*(日|号)", t)
+    if not m:
+        return None
+    try:
+        mm = int(m.group(1)); dd = int(m.group(2))
+        yy = int(getattr(now_d, "year", 1970) or 1970)
+        return dt_date(yy, mm, dd)
+    except Exception:
+        return None
+
+
+def _range_from_text(text: str, now_d):
+    """
+    Returns dict:
+      mode: 'single' | 'range'
+      label: '今天'/'明天'/'后天'/'' (optional)
+      offset: int (for relative single)
+      target_date: dt_date (for explicit single)
+      start_date: dt_date (for range)
+      end_date: dt_date (optional)
+      days: int (for '未来N天' / '接下来N天')
+    """
+    t = (text or "").strip()
+    out = {"mode": "single", "offset": 0, "label": ""}
+
+    if re.search(r"(今天|今日)", t):
+        out["label"] = "今天"
+        out["offset"] = 0
+    elif re.search(r"(明天|明日)", t):
+        out["label"] = "明天"
+        out["offset"] = 1
+    elif re.search(r"(后天)", t):
+        out["label"] = "后天"
+        out["offset"] = 2
+
+    m = re.search(r"(接下来|接下來|未来|未來)\s*(\d{1,2})\s*天", t)
+    if m:
+        out["mode"] = "range"
+        try:
+            out["days"] = int(m.group(2))
+        except Exception:
+            out["days"] = 3
+        out["start_date"] = now_d
+        out["label"] = ""
+        return out
+
+    m2 = re.search(r"(\d{4}-\d{2}-\d{2})", t)
+    if m2:
+        d = _parse_ymd(m2.group(1))
+        if d is not None:
+            out["target_date"] = d
+            out["label"] = m2.group(1)
+            out["offset"] = 0
+
+    if "target_date" not in out:
+        d2 = _cn_date_to_ymd(t, now_d)
+        if d2 is not None:
+            out["target_date"] = d2
+            out["label"] = str(int(d2.month)) + "月" + str(int(d2.day)) + "日"
+            out["offset"] = 0
+
+    m3 = re.search(r"(\d{4}-\d{2}-\d{2})\s*(到|至|~|-)\s*(\d{4}-\d{2}-\d{2})", t)
+    if m3:
+        d1 = _parse_ymd(m3.group(1))
+        d2 = _parse_ymd(m3.group(3))
+        if (d1 is not None) and (d2 is not None):
+            if d2 < d1:
+                d1, d2 = d2, d1
+            out = {"mode": "range", "start_date": d1, "end_date": d2, "label": m3.group(1) + "到" + m3.group(3)}
+            return out
+
+    return out
+# --- RANGE_PARSE_HELPERS_V1 END ---
+
+def _holiday_next_from_list(items: list, today_ymd: str) -> dict:
+    """Return the next holiday on/after today_ymd."""
+    try:
+        y = int(today_ymd[0:4]); mo = int(today_ymd[5:7]); da = int(today_ymd[8:10])
+        today = dt_date(y, mo, da)
+    except Exception:
+        return {"ok": False}
+
+    best = None
+    best_d = None
+    for x in items or []:
+        if not isinstance(x, dict):
+            continue
+        ds = str(x.get("date") or "").strip()
+        nm = str(x.get("name") or "").strip()
+        if len(ds) != 10:
+            continue
+        try:
+            yy = int(ds[0:4]); mm = int(ds[5:7]); dd = int(ds[8:10])
+            d = dt_date(yy, mm, dd)
+        except Exception:
+            continue
+        if d < today:
+            continue
+        if (best_d is None) or (d < best_d):
+            best_d = d
+            best = {"date": ds, "name": nm}
+
+    if not best or (best_d is None):
+        return {"ok": False}
+
+    try:
+        days = (best_d - today).days
+    except Exception:
+        days = None
+
+    out = {"ok": True, "date": best.get("date"), "name": best.get("name")}
+    if isinstance(days, int):
+        out["days"] = days
+    return out
+
+def _holiday_prev_from_list(items: list, today_ymd: str) -> dict:
+    """Return the most recent holiday on/before today_ymd."""
+    try:
+        y = int(today_ymd[0:4]); mo = int(today_ymd[5:7]); da = int(today_ymd[8:10])
+        today = dt_date(y, mo, da)
+    except Exception:
+        return {"ok": False}
+
+    best = None
+    best_d = None
+    for x in items or []:
+        if not isinstance(x, dict):
+            continue
+        ds = str(x.get("date") or "").strip()
+        nm = str(x.get("name") or "").strip()
+        if len(ds) != 10:
+            continue
+        try:
+            yy = int(ds[0:4]); mm = int(ds[5:7]); dd = int(ds[8:10])
+            d = dt_date(yy, mm, dd)
+        except Exception:
+            continue
+        if d > today:
+            continue
+        if (best_d is None) or (d > best_d):
+            best_d = d
+            best = {"date": ds, "name": nm}
+
+    if not best or (best_d is None):
+        return {"ok": False}
+
+    try:
+        days_ago = (today - best_d).days
+    except Exception:
+        days_ago = None
+
+    out = {"ok": True, "date": best.get("date"), "name": best.get("name")}
+    if isinstance(days_ago, int):
+        out["days_ago"] = days_ago
+    return out
+def _searxng_search(
+    base_url: str,
+    query: str,
+    categories: str,
+    language: str,
+    count: int,
+    time_range: Optional[str] = None,
+) -> Dict[str, Any]:
+    url = base_url.rstrip("/") + "/search"
+    params: Dict[str, Any] = {
+        "q": query,
+        "format": "json",
+        "categories": categories,
+        "language": language,
+        "count": int(count),
+    }
+    # Force engines to reduce low-quality sources (generic). Override via SEARXNG_ENGINES.
+    eng = os.getenv("SEARXNG_ENGINES", "").strip()
+    if not eng:
+        eng = "google,bing,duckduckgo"
+    params["engines"] = eng
+    if time_range:
+        params["time_range"] = time_range
+
+    timeout_s = float(os.getenv("SEARXNG_TIMEOUT", "8"))
+    headers = {"Accept": "application/json"}
+    al = _mcp__norm_accept_language(language)
+    if al:
+        headers["Accept-Language"] = al
+    resp = requests.get(url, params=params, headers=headers, timeout=timeout_s)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# --- MCP_PHASEB_DEFAULT_NORUNAWAY_V3 BEGIN ---
+# --- MCP_GENERAL_FIRST_TIME_NORM_V1 BEGIN ---
+# General-first + relative time normalization (tool-side, deterministic)
+def _mcp__normalize_relative_time(q):
+    try:
+        txt = str(q or "").strip()
+    except Exception:
+        return str(q or "").strip()
+
+    # If query already contains an explicit year, do not rewrite.
+    try:
+        if re.search(r"\b20\d{2}\b", txt):
+            return txt
+    except Exception:
+        return txt
+
+    try:
+        y = int(datetime.now().year)
+    except Exception:
+        y = 2026
+
+    txt = txt.replace("本年", str(y))
+    txt = txt.replace("今年", str(y))
+    txt = txt.replace("明年", str(y + 1))
+    txt = txt.replace("后年", str(y + 2))
+    return txt
+
+def _mcp__is_calendar_query(q):
+    t = str(q or "")
+    tl = t.lower()
+    keys_zh = ["公共假期", "假期", "节假日", "日历", "日期表", "时间表"]
+    for k in keys_zh:
+        if k in t:
+            return True
+    if ("public holiday" in tl) or ("public holidays" in tl) or ("holiday calendar" in tl):
+        return True
+    return False
+
+def _mcp__normalize_query(q):
+    txt = str(q or "").strip()
+    txt = _mcp__normalize_relative_time(txt)
+
+    # Public holidays are state-level; "Victoria" is usually more reliable than "Melbourne".
+    try:
+        if _mcp__has_zh(txt) and _mcp__is_calendar_query(txt):
+            if ("维多利亚" not in txt) and ("Victoria" not in txt):
+                if "墨尔本" in txt:
+                    txt = txt.replace("墨尔本", "维多利亚")
+                else:
+                    txt = txt + " 维多利亚"
+    except Exception:
+        pass
+
+    return txt
+# --- MCP_GENERAL_FIRST_TIME_NORM_V1 END ---
+
+# Phase B: defaults that reduce runaway / off-topic results.
+# - language='auto': Chinese -> zh-CN, else en
+# - categories='auto': event/news-like -> news, else general
+# - relevance self-check: if top results don't match query keywords, set relevance_low=True
+
+def _mcp__has_zh(text):
+    try:
+        return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
+    except Exception:
+        return False
+
+def _mcp__auto_language(query, language):
+    q = str(query or "").strip()
+    lg = str(language or "").strip()
+    if (not lg) or (lg.lower() == "auto"):
+        return "zh-CN" if _mcp__has_zh(q) else "en"
+    return lg
+
+
+def _mcp__norm_accept_language(lang):
+    # Normalize to a safe Accept-Language header value.
+    lg = str(lang or "").strip()
+    if not lg:
+        return ""
+    lg = lg.replace("_", "-")
+    if lg.lower() == "zh":
+        lg = "zh-CN"
+    base = lg.split("-")[0].strip()
+    if not base:
+        return lg
+    # Prefer requested locale, then base language, then English as fallback.
+    if base.lower() == "zh":
+        return lg + ",zh;q=0.9,en;q=0.2"
+    if base.lower() == "en":
+        return lg + ",en;q=0.9"
+    return lg + "," + base + ";q=0.9,en;q=0.2"
+
+def _mcp__looks_like_news_event(query):
+    q = str(query or "").strip()
+    if not q:
+        return False
+    # Heuristic keywords for Chinese news/event queries
+    if _mcp__has_zh(q):
+        keys = ["事件","新闻","怎么回事","为何","原因","通报","警方","官方","调查","最新","回应","通告","通报"]
+        for k in keys:
+            if k in q:
+                return True
+    else:
+        ql = q.lower()
+        keys = ["what happened","incident","breaking","news","statement","police","investigation","latest"]
+        for k in keys:
+            if k in ql:
+                return True
+    return False
+
+def _mcp__auto_categories(query, categories):
+    q = str(query or "").strip()
+    cat = str(categories or "").strip()
+    if (not cat) or (cat.lower() == "auto"):
+        return "news" if _mcp__looks_like_news_event(q) else "general"
+    return cat
+
+def _mcp__mk_keywords(query):
+    q = str(query or "").strip()
+    if not q:
+        return []
+    kws = []
+    # 1) Chinese fragments (existing behavior)
+    if _mcp__has_zh(q):
+        stop = set(["怎么","回事","什么","如何","怎么样","最新","情况","新闻","事件","问题"])
+        qq = re.sub(r"[^\u4e00-\u9fff]", "", q)
+        seen = set()
+        for L in [4,3,2]:
+            for i in range(0, max(0, len(qq) - L + 1)):
+                sub = qq[i:i+L]
+                if (not sub) or (sub in stop):
+                    continue
+                if sub in seen:
+                    continue
+                seen.add(sub)
+                kws.append(sub)
+                if len(kws) >= 8:
+                    break
+            if len(kws) >= 8:
+                break
+
+    # 2) ASCII tokens + adjacent bigrams (generic, no special-case)
+    toks = re.findall(r"[A-Za-z0-9]{2,}", q)
+    toks = [t.lower() for t in toks if t]
+    for t in toks:
+        if t not in kws:
+            kws.append(t)
+    if len(toks) >= 2:
+        i = 0
+        while i + 1 < len(toks):
+            bg = toks[i] + " " + toks[i+1]
+            if bg not in kws:
+                kws.append(bg)
+            i += 1
+
+    return kws[:12]
+
+def _mcp__is_relevant(title, snippet, kws):
+    t = (str(title or "") + " " + str(snippet or "")).strip()
+    if not t:
+        return False
+    tl = t.lower()
+
+    # Generic weak/low-signal tokens (not domain-specific)
+    weak = set(["home", "app", "login", "download", "官网", "入口", "windows", "电脑", "键盘"])
+
+    kws2 = []
+    for k in (kws or []):
+        kk = str(k or "").strip()
+        if kk:
+            kws2.append(kk)
+    if not kws2:
+        return True
+
+    hits = 0
+    seen = set()
+    for kk in kws2:
+        if _mcp__has_zh(kk):
+            if (kk in t) and (kk not in seen):
+                seen.add(kk)
+                hits += 1
+        else:
+            kl = kk.lower()
+            # ignore standalone weak words (keep phrases like 'home assistant' because it has space)
+            if (kl in weak) and (" " not in kl):
+                continue
+            if (kl in tl) and (kl not in seen):
+                seen.add(kl)
+                hits += 1
+
+    # Generic rule: if we have 3+ keywords, require 2+ distinct hits
+    if len(kws2) >= 3:
+        return True if hits >= 2 else False
+    return True if hits >= 1 else False
+
+# --- MCP_PHASEB_DEFAULT_NORUNAWAY_V3 END ---
+
+# @mcp.tool(description="Web search via local SearXNG. Returns short structured evidence. No cloud LLM is used.")
+def web_search(
+    query: str,
+    k: int = 3,
+    categories: str = "general",
+    language: str = "zh-CN",
+    time_range: str = "",
+) -> dict:
+    q = (query or "").strip()
+    q = _mcp__normalize_query(q)
+    if not q:
+        return {"ok": False, "error": "empty_query"}
+
+    # Phase B defaults
+    lang_used = _mcp__auto_language(q, language)
+    # General-first: if categories is empty/auto, start with general and optionally fallback to news.
+    cat_in = str(categories or "").strip()
+    if (not cat_in) or (cat_in.lower() == "auto"):
+        cat_used = "general"
+        _mcp__cat_auto = True
+    else:
+        cat_used = _mcp__auto_categories(q, categories)
+        _mcp__cat_auto = False
+    # If legacy defaults are used but query is Chinese, still adjust language only.
+    # IMPORTANT: do NOT override categories when user explicitly provides it (e.g., 'general').
+    try:
+        if _mcp__has_zh(q):
+            if str(language or "").strip().lower() in ("", "en"):
+                lang_used = "zh-CN"
+            cat_in = str(categories or "").strip().lower()
+            if cat_in in ("", "auto"):
+                cat_used = _mcp__auto_categories(q, "auto")
+    except Exception:
+        pass
+
+    kws = _mcp__mk_keywords(q)
+    relevance_low = None
+
+    try:
+        kk = int(k)
+    except Exception:
+        kk = 5
+    if kk < 1:
+        kk = 1
+    if kk > 10:
+        kk = 10
+
+    base_url = os.getenv("SEARXNG_URL", "http://192.168.1.162:8081").strip()
+    tr = time_range.strip() if time_range else None
+
+    try:
+        data = _searxng_search(
+            base_url=base_url,
+            query=q,
+            categories=str(cat_used or "general").strip(),
+            language=str(lang_used or "en").strip(),
+            count=kk,
+            time_range=tr,
+        )
+    except Exception as e:
+        return {"ok": False, "error": "searxng_failed", "base_url": base_url, "message": str(e)}
+
+    results_in = data.get("results") or []
+    results_out: List[Dict[str, Any]] = []
+    for item in results_in[:kk]:
+        results_out.append(
+            {
+                "title": (item.get("title") or "").strip(),
+                "url": (item.get("url") or "").strip(),
+                "snippet": _ug_clean_unicode((item.get("content") or "").strip()),
+                "engine": (item.get("engine") or "").strip(),
+                "score": item.get("score", None),
+            }
+        )
+
+    # Phase B: relevance self-check (top 5)
+    try:
+        top5 = results_out[:5]
+        rel_top5 = 0
+        for it in top5:
+            if _mcp__is_relevant(it.get("title"), it.get("snippet"), kws):
+                rel_top5 += 1
+        if _mcp__has_zh(q) and rel_top5 == 0:
+            relevance_low = True
+        else:
+            relevance_low = False
+    except Exception:
+        relevance_low = None
+
+    # Phase B: lightweight evidence block for the LLM (routing + grounded answering)
+    evidence = {}
+    try:
+        top = results_out[: min(3, len(results_out))]
+        prefer_zh = True if str(lang_used or "").strip().lower().startswith("zh") else False
+
+        # MCP_WS_V6: score-based selection (generic)
+        def _score(it):
+            try:
+                title = it.get("title")
+                snippet = it.get("snippet")
+                txt = (str(title or "") + " " + str(snippet or "")).lower()
+                kws2 = [str(k or "").strip().lower() for k in (kws or []) if str(k or "").strip()]
+                weak = set(["home", "app", "login", "download", "官网", "入口", "windows", "电脑", "键盘"])
+                hit = 0
+                phrase_hit = 0
+                seen = set()
+                for k in kws2:
+                    if (k in weak) and (" " not in k):
+                        continue
+                    if (k in txt) and (k not in seen):
+                        seen.add(k)
+                        hit += 1
+                    if (" " in k) and (k in txt):
+                        phrase_hit += 1
+                zh_bonus = 2 if (prefer_zh and _mcp__has_zh(txt)) else 0
+                return (hit * 10) + (phrase_hit * 6) + zh_bonus
+            except Exception:
+                return 0
+
+        best = None
+        best_score = -1
+        for it in results_out:
+            if not _mcp__is_relevant(it.get("title"), it.get("snippet"), kws):
+                continue
+            sc = _score(it)
+            if sc > best_score:
+                best_score = sc
+                best = it
+
+        # Generic auto-expand: if k small and score low, fetch more results once and re-score
+        try:
+            if (best_score < 12) and (kk <= 3):
+                kk2 = 8
+                data2 = _searxng_search(
+                    base_url=base_url,
+                    query=q,
+                    categories=cat_used,
+                    language=lang_used,
+                    count=int(kk2),
+                    time_range=tr,
+                )
+                r2 = data2.get("results") if isinstance(data2, dict) else None
+                if isinstance(r2, list):
+                    seen_url = set([str(it.get("url") or "") for it in results_out])
+                    for it2 in r2:
+                        title2 = str(it2.get("title") or "").strip()
+                        url2 = str(it2.get("url") or "").strip()
+                        sn2 = str(it2.get("content") or "").strip()
+                        if (not title2) or (not url2):
+                            continue
+                        if url2 in seen_url:
+                            continue
+                        seen_url.add(url2)
+                        results_out.append({"title": title2, "url": url2, "snippet": sn2})
+                    # re-score
+                    best = None
+                    best_score = -1
+                    for it in results_out:
+                        if not _mcp__is_relevant(it.get("title"), it.get("snippet"), kws):
+                            continue
+                        sc = _score(it)
+                        if sc > best_score:
+                            best_score = sc
+                            best = it
+        except Exception:
+            pass
+
+        if best is None and top:
+            best = top[0]
+
+        best_url = (best or {}).get("url")
+        best_title = (best or {}).get("title")
+        best_snippet = (best or {}).get("snippet") or ""
+
+        need_open = False
+        qtxt = q or ""
+        # queries that usually need full page (lists/dates/prices/versions/policies)
+        need_keys = ["具体", "列表", "日期", "时间", "安排", "版本", "更新", "价格", "多少钱", "政策", "条款", "细则"]
+        for k in need_keys:
+            if k in qtxt:
+                need_open = True
+                break
+        if len(best_snippet) < 120:
+            need_open = True
+        if relevance_low is True:
+            need_open = True
+
+        evidence = {
+            "top": top,
+            "best_url": best_url,
+            "best_title": best_title,
+            "best_snippet": best_snippet[:600],
+            "suggested_answer": (best_snippet[:400] if best_snippet else None),
+            "need_open_url_extract": need_open,
+        }
+    except Exception:
+        evidence = {}
+    return {
+        "ok": True,
+        "query": q,
+        "k": kk,
+        "categories": cat_used,
+        "language": lang_used,
+        "relevance_low": relevance_low,
+        "evidence": evidence,
+        "best_url": (evidence.get("best_url") if isinstance(evidence, dict) else None),
+        "best_title": (evidence.get("best_title") if isinstance(evidence, dict) else None),
+        "best_snippet": (evidence.get("best_snippet") if isinstance(evidence, dict) else None),
+        "answer_hint": (evidence.get("suggested_answer") if isinstance(evidence, dict) else None),
+        "need_open_url_extract": (evidence.get("need_open_url_extract") if isinstance(evidence, dict) else None),
+        "results": results_out,
+    }
+
+# @mcp.tool(description="Open a URL and return a short extracted excerpt (readable + unicode cleaned).")
+def open_url_extract(url: str, max_chars: int = 4000, timeout_sec: int = 10, accept_language: str = "") -> dict:
+    return _ug_open_url_fetch(url=url, max_chars=max_chars, timeout_sec=timeout_sec, accept_language=accept_language)
+
+
+# @mcp.tool(description="Fetch a web page and return a short plain-text excerpt (simple version for HA MCP).")
+def open_url(url: str, accept_language: str = "") -> dict:
+    out = _ug_open_url_fetch(url=url, max_chars=1200, timeout_sec=10, accept_language=accept_language)
+    if not out.get("ok"):
+        return {"ok": False, "url": url, "error": out.get("error", ""), "message": out.get("message", "")}
+    return {
+        "ok": True,
+        "url": out.get("url"),
+        "final_url": out.get("final_url"),
+        "status_code": out.get("status_code"),
+        "title": out.get("title", ""),
+        "excerpt": (out.get("excerpt") or "")[:1200],
+    }
+
+
+
+
+# ---- Router: route user requests by information shape (Structured / Retrieval / Open-domain) ----
+def _tz_name() -> str:
+    tz = os.getenv("TZ", "") or "Australia/Melbourne"
+    return tz
+
+def _now_local() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(_tz_name()))
+    except Exception:
+        return datetime.now()
+
+def _iso_local(d: datetime) -> str:
+    try:
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=ZoneInfo(_tz_name()))
+    except Exception:
+        pass
+    try:
+        return d.isoformat()
+    except Exception:
+        # very defensive
+        return str(d)
+
+def _extract_year(text: str, default_year: int) -> int:
+    t = text or ""
+    m = re.search(r"(19|20)\d{2}", t)
+    if not m:
+        return int(default_year)
+    try:
+        y = int(m.group(0))
+        return y
+    except Exception:
+        return int(default_year)
+
+def _looks_like_entity_id(text: str) -> bool:
+    # simple HA entity_id: domain.object_id
+    t = (text or "").strip()
+    if not t:
+        return False
+    return re.match(r"^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$", t) is not None
+
+def _route_type(user_text: str) -> str:
+    t = (user_text or "").strip().lower()
+
+    # Structured: holiday
+    if ("public holiday" in t) or ("holiday" in t) or ("假日" in t) or ("假期" in t) or ("公众假期" in t) or ("公休" in t) or ("维州" in t and "假" in t):
+        return "structured_holiday"
+
+    # Structured: calendar (support 日程/安排/提醒/事件/会议)
+    # Output wording uses "日程", but recognition keeps compatible keywords.
+    if ("calendar" in t) or ("日程" in t) or ("行程" in t) or ("安排" in t) or ("提醒" in t) or ("事件" in t) or ("会议" in t):
+        return "structured_calendar"
+    # Structured: weather
+    # Make it robust for Chinese phrasing variants like "今天的天气怎么样"
+    if ("weather" in t) or ("forecast" in t) or ("天气" in t) or ("天氣" in t) or ("预报" in t) or ("氣象" in t) or ("气温" in t) or ("溫度" in t) or ("温度" in t) or ("下雨" in t) or ("降雨" in t) or ("雨" in t and "量" in t) or ("风" in t and ("速" in t or "大" in t)):
+        return "structured_weather"
+
+    # Structured: direct entity state query
+    if _looks_like_entity_id(t):
+        return "structured_state"
+
+    return "open_domain"
+
+def _summarise_daily_forecast(fc: list) -> str:
+    if not isinstance(fc, list) or (len(fc) == 0):
+        return "暂无可用的天气预报数据。"
+    x = fc[0] if isinstance(fc[0], dict) else {}
+    cond = str(x.get("condition") or "").strip()
+
+    t_hi = x.get("temperature")
+    t_lo = x.get("templow")
+    rain = x.get("precipitation")
+    wind = x.get("wind_speed")
+
+    parts = []
+
+    # condition (keep raw token, but in Chinese skeleton)
+    if cond:
+        parts.append("天气: " + cond)
+
+    # temperature
+    if (t_hi is not None) and (t_lo is not None):
+        parts.append("最高/最低: " + str(t_hi) + "°C / " + str(t_lo) + "°C")
+    elif t_hi is not None:
+        parts.append("温度: " + str(t_hi) + "°C")
+
+    # precipitation (human)
+    if rain is not None:
+        try:
+            rv = float(rain)
+            if rv <= 0.0:
+                parts.append("预计无降雨")
+            else:
+                parts.append("预计降雨: " + str(rain))
+        except Exception:
+            parts.append("预计降雨: " + str(rain))
+
+    # wind (human bands)
+    if wind is not None:
+        try:
+            wv = float(wind)
+            if wv < 10:
+                parts.append("微风（约 " + str(wind) + "）")
+            elif wv < 20:
+                parts.append("有风（约 " + str(wind) + "）")
+            else:
+                parts.append("风较大（约 " + str(wind) + "）")
+        except Exception:
+            parts.append("风速: " + str(wind))
+
+    if not parts:
+        return "已获取天气预报。"
+    return "，".join(parts) + "。"
+
+# --- WEATHER_RANGE_V1 HELPERS BEGIN ---
+# --- CN_RANGE_EXT_V1 HELPERS BEGIN ---
+# CN_RANGE_EXT_V1_WEEKEND_PRIORITY
+# CN_RANGE_EXT_V1_DOM_FIX
+# Extended CN range parsing (week / weekend / month)
+def _cn_wd_to_idx(s: str):
+    t = str(s or "")
+    t = t.replace("星期", "周")
+    if "周天" in t:
+        return 6
+    if "周日" in t:
+        return 6
+    m = re.search(r"周([一二三四五六日天])", t)
+    if not m:
+        return None
+    c = m.group(1)
+    mp = {"一":0, "二":1, "三":2, "四":3, "五":4, "六":5, "日":6, "天":6}
+    return mp.get(c)
+
+def _week_start_monday(d):
+    try:
+        from datetime import timedelta
+        wd = int(d.weekday())
+        return d - timedelta(days=wd)
+    except Exception:
+        return d
+
+def _month_first_day(y, m):
+    from datetime import date as _date
+    return _date(int(y), int(m), 1)
+
+def _add_months_first_day(d, add_months):
+    try:
+        y = int(d.year)
+        mo = int(d.month)
+        mo2 = mo + int(add_months)
+        while mo2 > 12:
+            mo2 -= 12
+            y += 1
+        while mo2 < 1:
+            mo2 += 12
+            y -= 1
+        return _month_first_day(y, mo2)
+    except Exception:
+        return None
+
+def _end_of_month(d_first):
+    try:
+        from datetime import timedelta
+        next_first = _add_months_first_day(d_first, 1)
+        return next_first - timedelta(days=1)
+    except Exception:
+        return None
+
+def _parse_cn_week_month_range(text: str, now_d):
+    t = str(text or "").strip()
+    if not t:
+        return None
+    try:
+        from datetime import timedelta
+    except Exception:
+        timedelta = None
+
+    t_norm = t.replace("这个星期", "这周").replace("这个周", "这周").replace("星期", "周")
+    # CN_RANGE_EXT_V1_WEEKEND_PRIORITY: parse 周末 before whole-week rules
+    if "周末" in t_norm:
+        try:
+            from datetime import timedelta
+        except Exception:
+            timedelta = None
+        if timedelta is not None:
+            ws = _week_start_monday(now_d)
+            # 下周末 / 下星期周末
+            if ("下周末" in t_norm) or ("下星期周末" in t_norm) or ((("下周" in t_norm) or ("下星期" in t_norm)) and ("周末" in t_norm)):
+                ws2 = ws + timedelta(days=7)
+                sat = ws2 + timedelta(days=5)
+                sun = ws2 + timedelta(days=6)
+                return {"mode":"range","start_date": sat, "end_date": sun, "label":"下周末"}
+            # 这个周末 / 这周末 / 本周末 / 周末：取“当前或即将到来的周末”
+            wd = int(now_d.weekday())
+            if wd == 5:
+                sat = now_d
+                sun = now_d + timedelta(days=1)
+            elif wd == 6:
+                sat = now_d - timedelta(days=1)
+                sun = now_d
+            else:
+                sat = now_d + timedelta(days=(5 - wd))
+                sun = sat + timedelta(days=1)
+            return {"mode":"range","start_date": sat, "end_date": sun, "label":"这个周末"}
+
+
+    # CN_RANGE_EXT_V1_DOM_FIX: day-of-month parsing
+    def _mk_date(y, m, d):
+        try:
+            from datetime import date as _date
+            return _date(int(y), int(m), int(d))
+        except Exception:
+            return None
+
+    # 下个月N号 / 下月N号
+    m_dom_next = re.search(r"(?<!\d)(\d{1,2})(号|日)(?!\d)", t_norm)
+    if m_dom_next and (("下个月" in t_norm) or ("下月" in t_norm)):
+        dn = m_dom_next.group(1)
+        d_first = _add_months_first_day(now_d, 1)
+        if d_first is not None:
+            d_target = _mk_date(d_first.year, d_first.month, int(dn))
+            if d_target is not None:
+                return {"mode":"single", "target_date": d_target, "label":"下个月" + str(dn) + "号"}
+
+    # 本月N号 / 这个月N号
+    if m_dom_next and (("这个月" in t_norm) or ("本月" in t_norm)):
+        dn = m_dom_next.group(1)
+        d_target = _mk_date(now_d.year, now_d.month, int(dn))
+        if d_target is not None:
+            return {"mode":"single", "target_date": d_target, "label":"本月" + str(dn) + "号"}
+
+    # 仅 N号 / N日（无显式月份）：若 dn >= 今天几号 -> 本月；否则 -> 下个月
+    if m_dom_next and ("月" not in t_norm) and ("周" not in t_norm):
+        dn = int(m_dom_next.group(1))
+        if dn >= int(now_d.day):
+            d_target = _mk_date(now_d.year, now_d.month, dn)
+            if d_target is not None:
+                return {"mode":"single", "target_date": d_target, "label": str(dn) + "号"}
+        else:
+            d_first = _add_months_first_day(now_d, 1)
+            if d_first is not None:
+                d_target = _mk_date(d_first.year, d_first.month, dn)
+                if d_target is not None:
+                    return {"mode":"single", "target_date": d_target, "label": str(dn) + "号"}
+
+
+    # Month: next month first day / this month first day
+    if ("下个月" in t_norm) or ("下月" in t_norm):
+        if ("第一天" in t_norm) or ("1号" in t_norm) or ("1日" in t_norm):
+            d1 = _add_months_first_day(now_d, 1)
+            if d1 is not None:
+                return {"mode":"single","target_date": d1, "label":"下个月第一天"}
+        if ("日程" in t_norm) or ("日历" in t_norm) or ("日曆" in t_norm) or ("安排" in t_norm) or ("行程" in t_norm) or ("calendar" in t_norm) or ("event" in t_norm):
+            d_first = _add_months_first_day(now_d, 1)
+            d_last = _end_of_month(d_first) if d_first is not None else None
+            if (d_first is not None) and (d_last is not None):
+                return {"mode":"range","start_date": d_first, "end_date": d_last, "label":"下个月"}
+
+    if ("这个月" in t_norm) or ("本月" in t_norm):
+        if ("第一天" in t_norm) or ("1号" in t_norm) or ("1日" in t_norm):
+            d1 = _add_months_first_day(now_d, 0)
+            if d1 is not None:
+                return {"mode":"single","target_date": d1, "label":"本月第一天"}
+        if ("日程" in t_norm) or ("日历" in t_norm) or ("日曆" in t_norm) or ("安排" in t_norm) or ("行程" in t_norm) or ("calendar" in t_norm) or ("event" in t_norm):
+            d_first = _add_months_first_day(now_d, 0)
+            d_last = _end_of_month(d_first) if d_first is not None else None
+            if (d_first is not None) and (d_last is not None):
+                return {"mode":"range","start_date": d_first, "end_date": d_last, "label":"本月"}
+
+    # Weekday: 下周三 / 这周三 / 本周三 / 周三
+    m = re.search(r"(下周|下星期|这周|本周|周)([一二三四五六日天])", t_norm)
+    if m:
+        prefix = m.group(1)
+        target_wd = _cn_wd_to_idx("周" + m.group(2))
+        if (target_wd is not None) and (timedelta is not None):
+            ws = _week_start_monday(now_d)
+            if (prefix == "下周") or (prefix == "下星期"):
+                ws = ws + timedelta(days=7)
+            if prefix == "周":
+                cand = ws + timedelta(days=int(target_wd))
+                if cand < now_d:
+                    ws = ws + timedelta(days=7)
+            d_target = ws + timedelta(days=int(target_wd))
+            return {"mode":"single","target_date": d_target, "label": prefix + m.group(2)}
+
+    # Whole week: 下周 / 本周 / 这周
+    if ("下周" in t_norm) or ("下星期" in t_norm) or ("这周" in t_norm) or ("本周" in t_norm):
+        if timedelta is None:
+            return None
+        ws = _week_start_monday(now_d)
+        if ("下周" in t_norm) or ("下星期" in t_norm):
+            ws = ws + timedelta(days=7)
+            label = "下周"
+        else:
+            label = "本周"
+        we = ws + timedelta(days=6)
+        return {"mode":"range","start_date": ws, "end_date": we, "label": label}
+
+    # Weekend: 这个周末 / 周末 / 下周末
+    if "周末" in t_norm:
+        if timedelta is None:
+            return None
+        ws = _week_start_monday(now_d)
+        if ("下周末" in t_norm) or ("下星期周末" in t_norm) or (("下周" in t_norm or "下星期" in t_norm) and ("周末" in t_norm)):
+            ws2 = ws + timedelta(days=7)
+            sat = ws2 + timedelta(days=5)
+            sun = ws2 + timedelta(days=6)
+            return {"mode":"range","start_date": sat, "end_date": sun, "label":"下周末"}
+        wd = int(now_d.weekday())
+        if wd == 5:
+            sat = now_d
+            sun = now_d + timedelta(days=1)
+        elif wd == 6:
+            sat = now_d - timedelta(days=1)
+            sun = now_d
+        else:
+            sat = now_d + timedelta(days=(5 - wd))
+            sun = sat + timedelta(days=1)
+        return {"mode":"range","start_date": sat, "end_date": sun, "label":"这个周末"}
+
+    return None
+
+# --- CN_RANGE_EXT_V1 HELPERS END ---
+
+def _local_date_from_iso(dt_str: str, tzinfo) -> date:
+    try:
+        if not dt_str:
+            return None
+        dtx = datetime.fromisoformat(str(dt_str).replace('Z', '+00:00'))
+        if getattr(dtx, 'tzinfo', None) is None:
+            try:
+                dtx = dtx.replace(tzinfo=tzinfo)
+            except Exception:
+                pass
+        try:
+            dtx2 = dtx.astimezone(tzinfo)
+        except Exception:
+            dtx2 = dtx
+        return date(dtx2.year, dtx2.month, dtx2.day)
+    except Exception:
+        return None
+
+def _weather_range_from_text(text: str, now_local: object = None) -> dict:
+    """
+    Parse user text into a weather query:
+      - single day: today/tomorrow/day after tomorrow/explicit date
+      - range: next N days / explicit date range
+    Return dict:
+      {"mode":"single","offset":int,"label":str}
+      {"mode":"single","target_date": datetime.date, "label":str}
+      {"mode":"range","start_date": datetime.date, "days":int, "label":str}
+    """
+    out = {"mode": "single", "offset": 0, "label": ""}
+    t = str(text or "").strip()
+
+    # Normalize spaces
+    t2 = re.sub(r"\s+", " ", t)
+
+
+    # CN_RANGE_EXT_V1 APPLY WEATHER
+    try:
+        from datetime import datetime as _dt
+        if (now_local is not None) and hasattr(now_local, "year"):
+            from datetime import date as _date
+            now_d = _date(int(getattr(now_local, "year")), int(getattr(now_local, "month")), int(getattr(now_local, "day")))
+        else:
+            now_d = _dt.now().date()
+    except Exception:
+        now_d = None
+
+    if now_d is not None:
+        ext = _parse_cn_week_month_range(t2, now_d)
+        if isinstance(ext, dict):
+            if ext.get("mode") == "range":
+                sd = ext.get("start_date")
+                ed = ext.get("end_date")
+                if (sd is not None) and (ed is not None):
+                    try:
+                        days = (ed - sd).days + 1
+                        if days < 1:
+                            days = 1
+                    except Exception:
+                        days = 1
+                    return {"mode":"range", "start_date": sd, "days": int(days), "label": str(ext.get("label") or "")}
+            return ext
+
+    # Date range: YYYY-MM-DD 到 YYYY-MM-DD
+    m = re.search(r"(\d{4}-\d{2}-\d{2})\s*(到|至|\-)\s*(\d{4}-\d{2}-\d{2})", t2)
+    if m:
+        try:
+            from datetime import datetime as _dt
+            from datetime import date as _date
+            s1 = m.group(1)
+            s2 = m.group(3)
+            d1 = _dt.fromisoformat(s1).date()
+            d2 = _dt.fromisoformat(s2).date()
+            if d2 >= d1:
+                days = (d2 - d1).days + 1
+                if days < 1:
+                    days = 1
+                out = {"mode": "range", "start_date": d1, "days": int(days), "label": s1 + "到" + s2}
+                return out
+        except Exception:
+            pass
+
+    # Single explicit: YYYY-MM-DD
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", t2)
+    if m:
+        try:
+            from datetime import datetime as _dt
+            d = _dt.fromisoformat(m.group(1)).date()
+            out = {"mode": "single", "target_date": d, "label": m.group(1)}
+            return out
+        except Exception:
+            pass
+
+    # "1月26日" (assume current year)
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", t2)
+    if m:
+        try:
+            mm = int(m.group(1))
+            dd = int(m.group(2))
+            from datetime import date as _date
+            if now_local is not None and hasattr(now_local, "year"):
+                yy = int(getattr(now_local, "year"))
+            else:
+                from datetime import datetime as _dt
+                yy = int(_dt.now().year)
+            d = _date(yy, mm, dd)
+            out = {"mode": "single", "target_date": d, "label": str(mm) + "月" + str(dd) + "日"}
+            return out
+        except Exception:
+            pass
+
+    # Next N days: 接下来N天 / 未来N天 / 接下來N天 / 未來N天
+    m = re.search(r"(接下来|接下來|未来|未來)\s*(\d{1,2})\s*天", t2)
+    if m:
+        try:
+            n = int(m.group(2))
+        except Exception:
+            n = 3
+        if n < 1:
+            n = 1
+        out = {"mode": "range", "days": int(n), "label": m.group(1) + str(n) + "天"}
+        return out
+
+    # Relative days
+    if ("大后天" in t2) or ("大後天" in t2):
+        return {"mode": "single", "offset": 3, "label": "大后天"}
+    if ("后天" in t2) or ("後天" in t2):
+        return {"mode": "single", "offset": 2, "label": "后天"}
+    if ("明天" in t2):
+        return {"mode": "single", "offset": 1, "label": "明天"}
+    if ("今天" in t2) or ("今日" in t2):
+        return {"mode": "single", "offset": 0, "label": "今天"}
+
+    return out
+
+def _calendar_range_from_text(text: str, now_local: object = None) -> dict:
+    """
+    Parse user text into calendar query range.
+    Return:
+      {"mode":"single","offset":int,"label":str}
+      {"mode":"single","target_date": date, "label":str}
+      {"mode":"range","start_date": date, "days":int, "label":str}
+      {"mode":"range","start_date": date, "end_date": date, "label":str}
+    """
+    out = {"mode": "single", "offset": 0, "label": ""}
+    t = str(text or "").strip()
+    t2 = re.sub(r"\s+", " ", t)
+
+
+    # CN_RANGE_EXT_V1 APPLY CALENDAR
+    try:
+        from datetime import datetime as _dt
+        if (now_local is not None) and hasattr(now_local, "year"):
+            from datetime import date as _date
+            now_d = _date(int(getattr(now_local, "year")), int(getattr(now_local, "month")), int(getattr(now_local, "day")))
+        else:
+            now_d = _dt.now().date()
+    except Exception:
+        now_d = None
+
+    if now_d is not None:
+        ext = _parse_cn_week_month_range(t2, now_d)
+        if isinstance(ext, dict):
+            return ext
+
+    # YYYY-MM-DD 到 YYYY-MM-DD
+    m = re.search(r"(\d{4}-\d{2}-\d{2})\s*(到|至|\-)\s*(\d{4}-\d{2}-\d{2})", t2)
+    if m:
+        try:
+            from datetime import datetime as _dt
+            d1 = _dt.fromisoformat(m.group(1)).date()
+            d2 = _dt.fromisoformat(m.group(3)).date()
+            if d2 >= d1:
+                return {"mode": "range", "start_date": d1, "end_date": d2, "label": m.group(1) + "到" + m.group(3)}
+        except Exception:
+            pass
+
+    # YYYY-MM-DD
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", t2)
+    if m:
+        try:
+            from datetime import datetime as _dt
+            d = _dt.fromisoformat(m.group(1)).date()
+            return {"mode": "single", "target_date": d, "label": m.group(1)}
+        except Exception:
+            pass
+
+    # 1月26日
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日", t2)
+    if m:
+        try:
+            mm = int(m.group(1))
+            dd = int(m.group(2))
+            from datetime import date as _date
+            if now_local is not None and hasattr(now_local, "year"):
+                yy = int(getattr(now_local, "year"))
+            else:
+                from datetime import datetime as _dt
+                yy = int(_dt.now().year)
+            d = _date(yy, mm, dd)
+            return {"mode": "single", "target_date": d, "label": str(mm) + "月" + str(dd) + "日"}
+        except Exception:
+            pass
+
+    # 接下来N天/未来N天
+    m = re.search(r"(接下来|接下來|未来|未來)\s*(\d{1,2})\s*天", t2)
+    if m:
+        try:
+            n = int(m.group(2))
+        except Exception:
+            n = 3
+        if n < 1:
+            n = 1
+        return {"mode": "range", "days": int(n), "label": m.group(1) + str(n) + "天"}
+
+    if ("大后天" in t2) or ("大後天" in t2):
+        return {"mode": "single", "offset": 3, "label": "大后天"}
+    if ("后天" in t2) or ("後天" in t2):
+        return {"mode": "single", "offset": 2, "label": "后天"}
+    if ("明天" in t2):
+        return {"mode": "single", "offset": 1, "label": "明天"}
+    if ("今天" in t2) or ("今日" in t2):
+        return {"mode": "single", "offset": 0, "label": "今天"}
+
+    return out
+
+# --- MCP_ENTRYPOINT_AND_ROUTE_V1 ---
+
+# Notes:
+# - Fix "Restarting (0)" by providing a long-running entrypoint.
+# - Provide MCP tools: route_request + tools_selfcheck.
+# - No f-strings (project rule).
+
+def _safe_int(x, d):
+    try:
+        return int(x)
+    except Exception:
+        return d
+
+def _tzinfo():
+    tzname = os.environ.get("TZ") or "Australia/Melbourne"
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tzname)
+    except Exception:
+        return None
+
+def _now_local():
+    tz = _tzinfo()
+    try:
+        from datetime import datetime
+        return datetime.now(tz) if tz else datetime.now()
+    except Exception:
+        from datetime import datetime
+        return datetime.now()
+
+def _dt_from_iso(s):
+    try:
+        from datetime import datetime
+        t = str(s or "").strip()
+        if not t:
+            return None
+        t = t.replace("Z", "+00:00")
+        return datetime.fromisoformat(t)
+    except Exception:
+        return None
+
+def _local_date_from_forecast_item(it, tzinfo):
+    if not isinstance(it, dict):
+        return None
+    dt = _dt_from_iso(it.get("datetime"))
+    if dt is None:
+        return None
+    try:
+        if tzinfo is not None:
+            return dt.astimezone(tzinfo).date()
+        return dt.date()
+    except Exception:
+        try:
+            return dt.date()
+        except Exception:
+            return None
+
+def _summarise_weather_item(it):
+    if not isinstance(it, dict):
+        return "无可用预报。"
+    cond = str(it.get("condition") or "").strip()
+    tmax = it.get("temperature")
+    tmin = it.get("templow")
+    pr = it.get("precipitation")
+    ws = it.get("wind_speed")
+
+    parts = []
+    if cond:
+        parts.append("天气: " + cond)
+    if (tmax is not None) or (tmin is not None):
+        parts.append("最高/最低: " + str(tmax) + "°C / " + str(tmin) + "°C")
+    if pr is not None:
+        try:
+            prf = float(pr)
+        except Exception:
+            prf = None
+        if prf is not None:
+            parts.append("预计" + ("无降雨" if prf == 0.0 else ("降雨 " + str(pr))))
+    if ws is not None:
+        parts.append("有风（约 " + str(ws) + "）")
+
+    if not parts:
+        return "无可用预报。"
+    return "，".join(parts) + "。"
+
+def _pick_daily_forecast_by_local_date(fc_list, target_date, tzinfo):
+    if not isinstance(fc_list, list):
+        return None
+    for it in fc_list:
+        d = _local_date_from_forecast_item(it, tzinfo)
+        if d is None:
+            continue
+        if d == target_date:
+            return it
+    return None
+
+def _summarise_weather_range(fc_list, start_date, days, tzinfo):
+    if not isinstance(fc_list, list):
+        return "无可用预报。"
+    try:
+        days_i = int(days)
+    except Exception:
+        days_i = 3
+    if days_i < 1:
+        days_i = 1
+    # plugin typically only provides today + next 5 days
+    if days_i > 6:
+        days_i = 6
+
+    out = []
+    try:
+        from datetime import timedelta
+        for i in range(days_i):
+            d = start_date + timedelta(days=i)
+            it = _pick_daily_forecast_by_local_date(fc_list, d, tzinfo)
+            if it is None:
+                out.append(str(d) + ": 无预报")
+            else:
+                cond = str(it.get("condition") or "").strip()
+                tmax = it.get("temperature")
+                tmin = it.get("templow")
+                out.append(str(d) + ": " + cond + " " + str(tmax) + "/" + str(tmin) + "°C")
+    except Exception:
+        return "无可用预报。"
+    return "；".join(out) + "。"
+
+def _is_weather_query(t):
+    s = str(t or "")
+    keys = ["天气", "温度", "降雨", "下雨", "气温", "风", "预报", "天氣"]
+    for k in keys:
+        if k in s:
+            return True
+    return False
+
+def _is_calendar_query(t):
+    s = str(t or "")
+    keys = ["日程", "日历", "日曆", "安排", "行程", "提醒", "待办", "待辦", "event", "calendar"]
+    for k in keys:
+        if k in s:
+            return True
+    return False
+
+def _is_holiday_query(t):
+    s = str(t or "")
+    keys = ["公众假期", "公眾假期", "法定假日", "假期", "假日", "holiday"]
+    for k in keys:
+        if k in s:
+            return True
+    return False
+
+def _looks_like_entity_id(t):
+    s = str(t or "").strip()
+    if " " in s or "　" in s:
+        return False
+    if re.match(r"^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$", s):
+        return True
+    return False
+
+def _iso_day_start_end(d, tzinfo):
+    from datetime import datetime, timedelta
+    try:
+        if tzinfo:
+            start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tzinfo)
+        else:
+            start = datetime(d.year, d.month, d.day, 0, 0, 0)
+        end = start + timedelta(days=1)
+        return start.isoformat(), end.isoformat()
+    except Exception:
+        start = datetime(d.year, d.month, d.day, 0, 0, 0)
+        end = start + timedelta(days=1)
+        return start.isoformat(), end.isoformat()
+
+def _summarise_calendar_events(events):
+    if (not isinstance(events, list)) or (len(events) == 0):
+        return "没有日程。"
+    parts = []
+    lim = 6
+    for it in events[:lim]:
+        if not isinstance(it, dict):
+            continue
+        summ = str(it.get("summary") or "").strip()
+        st = it.get("start") or {}
+        if isinstance(st, dict) and st.get("date"):
+            ds = str(st.get("date") or "").strip()
+            if ds:
+                parts.append(ds + " 全天 " + summ)
+            else:
+                parts.append("全天 " + summ)
+        else:
+            dt = None
+            if isinstance(st, dict):
+                dt = st.get("dateTime") or st.get("datetime")
+            if dt:
+                dts = str(dt)
+                # Best-effort format: YYYY-MM-DD HH:MM
+                if len(dts) >= 16 and "T" in dts:
+                    d = dts[:10]
+                    tm = dts[11:16]
+                    parts.append(d + " " + tm + " " + summ)
+                else:
+                    parts.append(dts + " " + summ)
+            else:
+                parts.append(summ)
+    if len(events) > lim:
+        parts.append("等共 " + str(len(events)) + " 条")
+    return "；".join([p for p in parts if p]) + "。"
+
+# --- NEWS_DIGEST_V1 BEGIN ---
+# Semi-structured retrieval: News digest via local SearXNG + domain allow-list.
+# Chinese-first with minimal English fallback. No hallucinated news.
+
+NEWS_SOURCES = {
+    "world": {
+        "zh": [
+            "thepaper.cn",
+            "caixin.com",
+            "ifeng.com",
+            "bbc.com/zhongwen",
+            "bbc.com/zh",
+            "dw.com/zh",
+            "dw.com/zh-hans",
+        ],
+        "en": [
+            "reuters.com",
+            "apnews.com",
+            "bbc.com",
+            "theguardian.com",
+            "aljazeera.com",
+        ],
+    },
+    "cn_finance": {
+        "zh": [
+            "caixin.com",
+            "yicai.com",
+        ],
+        "en": [
+            "reuters.com",
+        ],
+    },
+    "au_politics": {
+        "zh": [
+            "sbs.com.au/language/chinese",
+            "abc.net.au/chinese",
+        ],
+        "en": [
+            "abc.net.au",
+            "sbs.com.au/news",
+            "theguardian.com/au",
+            "aph.gov.au",
+            "aec.gov.au",
+            "pm.gov.au",
+            "homeaffairs.gov.au",
+            "treasury.gov.au",
+        ],
+    },
+    "mel_life": {
+        "zh": [
+            "sbs.com.au/language/chinese",
+            "abc.net.au/chinese",
+        ],
+        "en": [
+            "abc.net.au",
+            "9news.com.au",
+            "melbourne.vic.gov.au",
+        ],
+        "region_keywords": ["melbourne", "victoria", "vic", "ptv", "metro", "yarra", "docklands", "cbd"],
+    },
+    "tech_internet": {
+        "zh": [
+            "36kr.com",
+            "huxiu.com",
+        ],
+        "en": [
+            "theverge.com",
+            "techcrunch.com",
+            "wired.com",
+            "arstechnica.com",
+        ],
+    },
+    "tech_gadgets": {
+        "zh": [
+            "sspai.com",
+            "ifanr.com",
+        ],
+        "en": [
+            "theverge.com",
+        ],
+    },
+    "gaming": {
+        "zh": [
+            "gcores.com",
+        ],
+        "en": [
+            "ign.com",
+            "pcgamer.com",
+        ],
+    },
+}
+
+NEWS_QUERY_ZH = {
+    "world": "国际 要闻",
+    "cn_finance": "中国 财经",
+    "au_politics": "澳洲 联邦 政治 议会 工党 反对党",
+    "mel_life": "墨尔本 维州 民生 交通 火警 警情",
+    "tech_internet": "互联网 科技 AI 开源 监管",
+    "tech_gadgets": "数码 新品 评测 上手",
+    "gaming": "游戏 新闻 Steam 主机 更新",
+}
+
+NEWS_QUERY_EN = {
+    "world": "world news breaking",
+    "cn_finance": "China economy finance market",
+    "au_politics": "Australian politics federal parliament Canberra",
+    "mel_life": "Melbourne Victoria local news transport police",
+    "tech_internet": "internet technology AI regulation",
+    "tech_gadgets": "gadgets review launch hands-on",
+    "gaming": "game news patch update release",
+}
+
+NEWS_STOPWORDS = [
+    "给我", "来点", "今天", "最新", "要闻", "新闻", "快讯", "头条",
+    "世界", "国际", "中国", "财经", "澳洲", "澳大利亚", "政治",
+    "墨尔本", "维州", "本地", "民生", "互联网", "科技", "数码", "产品", "游戏", "电竞",
+    "please", "today", "latest", "news", "world", "china", "finance", "australia", "politics", "melbourne", "tech", "gaming"
+]
+
+def _news__is_query(text: str) -> bool:
+    t = str(text or "")
+    tl = t.lower()
+    keys = ["新闻", "要闻", "热点", "快讯", "头条", "发生了什么", "最新消息", "news", "breaking"]
+    for k in keys:
+        if (k in t) or (k in tl):
+            return True
+    cats = ["世界", "国际", "中国", "财经", "澳洲", "澳大利亚", "政治", "墨尔本", "维州", "本地", "民生", "互联网", "科技", "数码", "产品", "游戏", "电竞"]
+    for k in cats:
+        if k in t:
+            return True
+    return False
+
+def _news__category_from_text(text: str) -> str:
+    t = str(text or "")
+    tl = t.lower()
+
+    if ("墨尔本" in t) or ("维州" in t) or ("melbourne" in tl) or ("victoria" in tl) or ("vic" in tl):
+        return "mel_life"
+
+    if ("澳洲" in t) or ("澳大利亚" in t) or ("australia" in tl) or ("australian" in tl):
+        return "au_politics"
+
+    if ("中国" in t) and (("财经" in t) or ("金融" in t) or ("股" in t) or ("人民币" in t)):
+        return "cn_finance"
+    if ("财经" in t) or ("金融" in t) or ("a股" in tl):
+        return "cn_finance"
+
+    if ("互联网" in t) or ("ai" in tl) or ("openai" in tl) or ("监管" in t) or ("科技" in t):
+        return "tech_internet"
+    if ("数码" in t) or ("手机" in t) or ("相机" in t) or ("耳机" in t) or ("笔记本" in t) or ("评测" in t) or ("新品" in t):
+        return "tech_gadgets"
+    if ("游戏" in t) or ("电竞" in t) or ("steam" in tl) or ("ps5" in tl) or ("xbox" in tl) or ("switch" in tl):
+        return "gaming"
+
+    if ("世界" in t) or ("国际" in t) or ("global" in tl) or ("world" in tl):
+        return "world"
+
+    return "world"
+
+def _news__time_range_from_text(text: str) -> str:
+    t = str(text or "")
+    tl = t.lower()
+    if ("本周" in t) or ("这一周" in t) or ("过去一周" in t) or ("week" in tl):
+        return "week"
+    if ("本月" in t) or ("过去一个月" in t) or ("month" in tl):
+        return "month"
+    return "day"
+
+def _news__site_filter(domains):
+    ds = []
+    for d in domains or []:
+        dd = str(d or "").strip()
+        if dd:
+            ds.append(dd)
+    if not ds:
+        return ""
+    parts = []
+    for d in ds[:10]:
+        parts.append("site:" + d)
+    if len(parts) == 1:
+        return parts[0]
+    return "(" + " OR ".join(parts) + ")"
+
+def _news__canonical_url(url: str) -> str:
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    x = u
+    if x.startswith("http://"):
+        x = x[len("http://"):]
+    if x.startswith("https://"):
+        x = x[len("https://"):]
+    x = x.split("#")[0]
+    x = x.split("?")[0]
+    parts = x.split("/", 1)
+    host = parts[0].strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+    path = ""
+    if len(parts) == 2:
+        path = "/" + parts[1]
+    return host + path
+
+def _news__source_from_url(url):
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    x = u
+    if x.startswith("http://"):
+        x = x[len("http://"):]
+    if x.startswith("https://"):
+        x = x[len("https://"):]
+    x = x.split("/")[0].strip()
+    return x
+
+def _news__summarise_item(snippet, fallback_title):
+    s = str(snippet or "").strip()
+    if len(s) >= 30:
+        s = " ".join(s.split())
+        return s[:160]
+    t = str(fallback_title or "").strip()
+    if t:
+        return t[:80]
+    return "（摘要缺失）"
+
+def _news__clean_user_query(user_text: str) -> str:
+    t = str(user_text or "").strip()
+    if not t:
+        return ""
+    x = t
+    for w in NEWS_STOPWORDS:
+        x = x.replace(w, " ")
+    x = " ".join(x.split()).strip()
+    if len(x) < 3:
+        return ""
+    return x[:120]
+
+def _news__must_keywords(category: str):
+    if category == "au_politics":
+        return ["australia", "australian", "canberra", "parliament", "election", "budget", "albanese", "labor", "coalition", "greens", "澳", "联邦", "议会", "工党", "反对党", "选举", "预算"]
+    if category == "mel_life":
+        return ["melbourne", "victoria", "vic", "ptv", "metro", "yarra", "cbd", "docklands", "墨尔本", "维州", "公交", "火警", "警方", "交通"]
+    return []
+
+def _news__match_must_keywords(category: str, title: str, summary: str) -> bool:
+    must = _news__must_keywords(category)
+    if not must:
+        return True
+    blob = (str(title or "") + " " + str(summary or "")).lower()
+    for k in must:
+        kk = str(k or "").lower()
+        if kk and (kk in blob):
+            return True
+    return False
+
+def _news__pick_results(results, allow_domains, category):
+    out = []
+    seen = set()
+    host_count = {}
+
+    allow = []
+    for d in allow_domains or []:
+        dd = str(d or "").strip()
+        if dd:
+            allow.append(dd)
+
+    for it in results or []:
+        if not isinstance(it, dict):
+            continue
+        url = str(it.get("url") or "").strip()
+        title = str(it.get("title") or "").strip()
+        sn = str(it.get("snippet") or "").strip()
+        if (not url) or (not title):
+            continue
+
+        if allow:
+            ok_domain = False
+            for d in allow:
+                if d and (d in url):
+                    ok_domain = True
+                    break
+            if not ok_domain:
+                continue
+
+        canon = _news__canonical_url(url)
+        if not canon:
+            continue
+        if canon in seen:
+            continue
+
+        host = canon.split("/", 1)[0]
+        cnt = host_count.get(host, 0)
+        if cnt >= 2:
+            continue
+
+        summ = _news__summarise_item(sn, title)
+        if not _news__match_must_keywords(category, title, summ):
+            continue
+
+        seen.add(canon)
+        host_count[host] = cnt + 1
+
+        out.append({"title": title, "url": url, "snippet": sn})
+        if len(out) >= 12:
+            break
+
+    return out
+def _news__coerce_rules(x):
+    """
+    允许 rules_zh / rules_en 为:
+      - list[dict]（推荐）
+      - list[str]（会转换为 dict）
+      - dict（会包成单元素 list）
+      - str（尝试 json.loads；失败则当作 domain 字符串）
+      - None（转为空 list）
+    返回: list[dict]
+    """
+    if x is None:
+        return []
+    if isinstance(x, list):
+        out = []
+        for it in x:
+            if isinstance(it, dict):
+                out.append(it)
+            elif isinstance(it, str):
+                dom = it.strip()
+                if dom:
+                    out.append({"domain": dom})
+        return out
+    if isinstance(x, dict):
+        return [x]
+    if isinstance(x, str):
+        t = x.strip()
+        if not t:
+            return []
+        if (t.startswith("[") and t.endswith("]")) or (t.startswith("{") and t.endswith("}")):
+            try:
+                j = json.loads(t)
+                return _news__coerce_rules(j)
+            except Exception:
+                pass
+        return [{"domain": t}]
+    return []
+
+
+
+def _news__build_query(category, user_text, lang):
+    c = str(category or "").strip()
+    lg = str(lang or "").strip()
+    uq = _news__clean_user_query(user_text)
+
+    base = uq
+    if not base:
+        if lg == "en":
+            base = str(NEWS_QUERY_EN.get(c) or "news")
+        else:
+            base = str(NEWS_QUERY_ZH.get(c) or "新闻")
+
+    # hard-bias for local categories
+    if c == "mel_life":
+        if ("melbourne" not in base.lower()) and ("墨尔本" not in base):
+            base = base + " Melbourne Victoria"
+    if c == "au_politics":
+        if ("australia" not in base.lower()) and ("澳" not in base):
+            base = base + " Australia 澳洲 联邦"
+
+    if len(base) > 160:
+        base = base[:160]
+    return base
+
+def _news__search_one(category, lang, time_range, user_text):
+    c = str(category or "").strip()
+    lg = str(lang or "").strip()
+    tr = str(time_range or "").strip()
+
+    src = NEWS_SOURCES.get(c) or {}
+    domains = src.get(lg) or []
+
+    q = _news__build_query(c, user_text, lg)
+    sf = _news__site_filter(domains)
+
+    query = q
+    if sf:
+        query = q + " " + sf
+
+    r = web_search(
+        query=query,
+        k=10,
+        categories="news",
+        language=("zh-CN" if lg == "zh" else "en"),
+        time_range=tr,
+    )
+    if not r.get("ok"):
+        return {"ok": False, "query": query, "error": r.get("error"), "message": r.get("message")}
+
+    picked = _news__pick_results(r.get("results") or [], domains, c)
+    return {"ok": True, "query": query, "picked": picked}
+
+def _news__format_digest(items, limit):
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 5
+    if lim < 1:
+        lim = 1
+    if lim > 10:
+        lim = 10
+
+    it = items or []
+    if (not isinstance(it, list)) or (len(it) == 0):
+        return "暂无符合来源池的新闻结果。"
+
+    out = []
+    idx = 1
+    for x in it[:lim]:
+        if not isinstance(x, dict):
+            continue
+        title = str(x.get("title") or "").strip()
+        url = str(x.get("url") or "").strip()
+        src = str(x.get("source") or "").strip()
+        summ = str(x.get("summary") or "").strip()
+
+        if not src:
+            src = _news__source_from_url(url)
+        if not summ:
+            summ = _news__summarise_item(x.get("snippet"), title)
+
+        line = str(idx) + ") " + title
+        if src:
+            line = line + "（" + src + "）"
+        out.append(line)
+        out.append("   " + summ)
+        idx += 1
+
+    return "\n".join(out).strip()
+
+
+def _news__voice_from_items(items: list) -> str:
+    """Build TTS-friendly text (no URLs) from news items."""
+    try:
+        out = []
+        for i, it in enumerate(items or [], 1):
+            t = (it.get("title") or "").strip()
+            src = (it.get("source") or "").strip()
+            pa = (it.get("published_at") or "").strip()
+            sn = (it.get("snippet") or "").strip()
+            meta = []
+            if src:
+                meta.append(src)
+            if pa:
+                meta.append(pa)
+            head = "{0}) {1}".format(i, t)
+            if meta:
+                head = head + "（{0}）".format(" | ".join(meta))
+            out.append(head)
+            if sn:
+                x = sn
+                if len(x) > 90:
+                    x = x[:90].rstrip() + "..."
+                out.append(x)
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+@mcp.tool(
+    name="news_digest",
+    description="(Tool) News digest via Miniflux (RSS). Reads entries from the last 24 hours (rolling 24h). Category-driven; default 5 items. Chinese-first with lightweight topic filtering and fallback."
+)
+def news_digest(category: str = "world",
+               limit: int = 5,
+               time_range: str = "24h",
+               prefer_lang: str = "zh",
+               user_text: str = "",
+               **kwargs) -> dict:
+    """
+    Miniflux-backed news digest.
+
+    Hard rules:
+    - Source of truth: Miniflux (RSS aggregator)
+    - Window: last 24 hours (rolling 24h), regardless of time_range input
+    - Output: default 5 items, Chinese-first; if not enough, fallback to English
+    - Lightweight topic filter to reduce category pollution:
+        * blacklist keywords -> drop
+        * whitelist keywords (when available) -> keep if hit, otherwise filtered
+        * if filtered results not enough -> relax whitelist, then cross-language fill
+    """
+
+    base_url = os.environ.get("MINIFLUX_BASE_URL") or "http://192.168.1.162:19091"
+    token = os.environ.get("MINIFLUX_API_TOKEN") or ""
+    if not token.strip():
+        return {
+            "ok": False,
+            "error": "MINIFLUX_API_TOKEN is not set",
+            "category": category,
+            "time_range": "24h",
+            "limit": limit,
+            "items": [],
+            "final": "Miniflux API Token 未配置（MINIFLUX_API_TOKEN）。"
+        }
+
+    def _mf_req(path: str, params: dict = None) -> dict:
+        url = base_url.rstrip("/") + path
+        headers = {"X-Auth-Token": token}
+        try:
+            r = requests.get(url, headers=headers, params=(params or {}), timeout=12)
+            if int(getattr(r, "status_code", 0) or 0) >= 400:
+                return {"ok": False, "status": int(r.status_code), "text": (r.text or "")[:500]}
+            return {"ok": True, "data": r.json()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _strip_html(s: str) -> str:
+        if not s:
+            return ""
+        try:
+            s2 = re.sub(r"<[^>]+>", " ", s)
+            s2 = html.unescape(s2)
+            s2 = re.sub(r"\s+", " ", s2).strip()
+            return s2
+        except Exception:
+            return (s or "").strip()
+
+    def _to_local_time(iso_str: str) -> str:
+        if not iso_str:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            tzname = os.environ.get("TZ") or "Australia/Melbourne"
+            dt2 = dt.astimezone(ZoneInfo(tzname))
+            return dt2.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return iso_str
+
+    def _has_cjk(s: str) -> bool:
+        if not s:
+            return False
+        try:
+            han = 0
+            total = 0
+            for ch in s:
+                oc = ord(ch)
+                if ch.isspace():
+                    continue
+                total += 1
+                if (0x4E00 <= oc <= 0x9FFF) or (0x3400 <= oc <= 0x4DBF) or (0x20000 <= oc <= 0x2A6DF):
+                    han += 1
+            if total <= 0:
+                return False
+            if han >= 8:
+                return True
+            return (float(han) / float(total)) >= 0.12
+        except Exception:
+            return False
+
+    def _news__norm_kw(s: str) -> str:
+        s2 = _ug_clean_unicode(s or "")
+        s2 = s2.lower()
+        try:
+            s2 = re.sub(r"\s+", " ", s2).strip()
+        except Exception:
+            s2 = (s2 or "").strip()
+        return s2
+
+    def _kw_hit(text_s: str, kws: list) -> bool:
+        if not text_s:
+            return False
+        t0 = _news__norm_kw(text_s)
+        if not t0:
+            return False
+        for k in (kws or []):
+            kk = _news__norm_kw(k or "")
+            if not kk:
+                continue
+            if kk in t0:
+                return True
+        return False
+    def _norm_title(s: str) -> str:
+        s2 = _ug_clean_unicode(s or "")
+        s2 = s2.lower()
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+
+    cats = _mf_req("/v1/categories")
+    if not cats.get("ok"):
+        return {"ok": False, "error": "failed to fetch miniflux categories", "detail": cats, "category": category, "time_range": "24h", "limit": limit, "items": [], "final": "Miniflux categories 拉取失败。"}
+
+    categories = cats.get("data") or []
+    key = (category or "").strip()
+    category_input = key
+
+    aliases_map = {
+        # NOTE: aliases_map is ONLY for matching Miniflux category TITLES.
+        # Do NOT put generic keywords here (e.g. 'Australia', 'AU', 'Victoria', '澳').
+        # Keep it strict to avoid matching the wrong Miniflux category.
+        "world": ["world（世界新闻）", "世界新闻", "World", "Global", "International"],
+        "cn_finance": ["cn_finance（中国财经）", "中国财经", "财经", "China finance", "CN Finance"],
+        "au_politics": ["au_politics（澳洲政治）", "澳洲政治", "澳大利亚政治", "Australian politics", "AU politics"],
+        "mel_life": ["mel_life（墨尔本民生）", "墨尔本本地", "墨尔本民生", "Melbourne local", "Victoria local", "The Guardian - Victoria", "Victoria"],
+        "tech_internet": ["tech_internet（互联网科技）", "互联网科技", "Tech internet", "Tech"],
+        "tech_gadgets": ["tech_gadgets（数码评测）", "数码新品", "数码评测", "Gadgets", "Reviews"],
+        "gaming": ["gaming（游戏）", "游戏", "Gaming"],
+    }
+
+    def _match_cat_id(k: str):
+        if not k:
+            return None
+        for c in categories:
+            try:
+                title = (c.get("title") or "").strip()
+                if title == k:
+                    return int(c.get("id"))
+            except Exception:
+                continue
+        for c in categories:
+            try:
+                title = (c.get("title") or "").strip()
+                if title.startswith(k) or (k in title):
+                    return int(c.get("id"))
+            except Exception:
+                continue
+        for al in (aliases_map.get(k) or []):
+            for c in categories:
+                try:
+                    title = (c.get("title") or "").strip()
+                    if (al in title) or title == al:
+                        return int(c.get("id"))
+                except Exception:
+                    continue
+        return None
+
+
+    cat_id = _match_cat_id(key)
+    if not cat_id:
+        # Fallback: try original input once.
+        cat_id2 = None
+        if category_input and (category_input != key):
+            cat_id2 = _match_cat_id(category_input)
+        if cat_id2:
+            cat_id = cat_id2
+        else:
+            return {
+                "ok": True,
+                "category": key,
+                "category_input": category_input,
+                "stats": None,
+                "stats_detail": None,
+                "dropped_topicban": None,
+                "final": "Miniflux 中找不到对应分类：{0}".format(category_input),
+                "final_voice": "",
+            }
+
+    import time as _time
+    after_ts = int(_time.time()) - 24 * 3600
+
+    try:
+        lim_int = int(limit)
+    except Exception:
+        lim_int = 5
+    if lim_int < 1:
+        lim_int = 1
+    if lim_int > 10:
+        lim_int = 10
+
+    fetch_lim = lim_int * 6
+    if fetch_lim < 20:
+        fetch_lim = 20
+    if fetch_lim > 80:
+        fetch_lim = 80
+
+    params = {"order": "published_at", "direction": "desc", "limit": fetch_lim, "after": after_ts}
+    ent = _mf_req("/v1/categories/{0}/entries".format(cat_id), params=params)
+    if not ent.get("ok"):
+        return {"ok": False, "error": "failed to fetch entries", "detail": ent, "category": key, "time_range": "24h", "limit": lim_int, "items": [], "final": "Miniflux entries 拉取失败。"}
+
+    payload = ent.get("data") or {}
+    entries = payload.get("entries") or []
+    if not entries:
+        return {"ok": True, "category": key, "time_range": "24h", "limit": lim_int, "items": [], "final": "暂无符合最近24小时的条目。", "query_used": "miniflux category_id={0} after={1}".format(cat_id, after_ts)}
+
+    all_items = []
+    for e in entries:
+        try:
+            title = (e.get("title") or "").strip()
+            url = (e.get("url") or "").strip() or (e.get("comments_url") or "").strip()
+            published_at_raw = (e.get("published_at") or "").strip()
+            published_at = _to_local_time(published_at_raw)
+            feed = e.get("feed") or {}
+            src = (feed.get("title") or "").strip()
+            content_plain = _strip_html((e.get("content") or "").strip())
+            snippet = content_plain
+            if len(snippet) > 180:
+                snippet = snippet[:180].rstrip() + "..."
+            is_zh = _has_cjk((title or "") + " " + (content_plain or ""))
+            all_items.append({
+                "title": title,
+                "url": url,
+                "published_at": published_at,
+                "published_at_raw": published_at_raw,
+                "source": src,
+                "snippet": snippet,
+                "is_zh": is_zh,
+                "content_plain": content_plain,
+            })
+        except Exception:
+            continue
+
+    cfg = FILTERS.get(key) or {"whitelist": [], "blacklist": []}
+    wl = cfg.get("whitelist") or []
+    bl = cfg.get("blacklist") or []
+
+    # --- NEWS_TOPICBAN_P2 BEGIN ---
+    TOPIC_BANS = {
+        "au_politics": [
+            # sports noise
+            "socceroos", "afl", "nrl", "a-league", "aleague", "a league",
+            "match", "goal", "fixture", "kickoff", "coach", "striker", "midfielder",
+            "st pauli", "bundesliga", "premier league", "champions league", "uefa",
+            "injury", "transfer", "scores", "highlights",
+        ],
+        "mel_life": [
+            # lawn / garden fluff
+            "ugliest lawn", "lawn", "garden", "grass", "yard", "groundskeeper", "watering", "mowing",
+            "草坪", "花园", "花園", "最丑", "最醜",
+        ],
+    }
+
+    def _passes_topicban(it: dict) -> bool:
+        bans = TOPIC_BANS.get(key) or []
+        if not bans:
+            return True
+        txt = "{0} {1} {2}".format(it.get("title") or "", it.get("snippet") or "", it.get("source") or "")
+        return (not _kw_hit(txt, bans))
+    # --- NEWS_TOPICBAN_P2 END ---
+
+    dropped_blacklist = 0
+    dropped_topicban = 0
+    dropped_whitelist = 0
+    dropped_anchor = 0
+    dropped_intlban = 0
+    relax_used = 0
+    STRICT_WL_CATS = set(["au_politics"])
+    require_wl = True if (key in STRICT_WL_CATS) else False
+
+    def _passes_blacklist(it: dict) -> bool:
+        txt = "{0} {1} {2}".format(it.get("title") or "", it.get("snippet") or "", it.get("source") or "")
+        return (not _kw_hit(txt, bl))
+
+    def _passes_whitelist(it: dict) -> bool:
+        if not wl:
+            return True
+        txt = "{0} {1}".format(it.get("title") or "", it.get("snippet") or "")
+        return _kw_hit(txt, wl)
+
+    MUST_ANCHOR = {
+
+        "au_politics": ["australia", "australian", "canberra", "federal", "commonwealth", "parliament", "senate", "house", "minister", "cabinet", "opposition", "prime minister", "pm", "treasurer", "budget", "bill", "legislation", "labor", "liberal", "coalition", "greens", "nationals", "albanese", "dutton", "ley", "hastie", "nsw", "vic", "qld", "wa", "sa", "tas", "act", "nt", "sydney", "melbourne", "brisbane", "perth", "adelaide", "hobart", "darwin", "australian election", "by-election", "immigration", "visa", "citizenship", "澳大利亚", "澳洲", "堪培拉", "联邦", "议会", "参议院", "众议院", "部长", "内阁", "反对党", "总理", "财政", "预算", "法案", "立法", "工党", "自由党", "联盟党", "绿党", "国家党", "阿尔巴尼斯", "达顿", "苏珊", "哈斯蒂", "新州", "维州", "昆州", "西澳", "南澳", "塔州", "首都领地", "北领地", "移民", "签证", "入籍", "选举"],
+
+        "mel_life": ["melbourne", "victoria", "vic", "ptv", "metro", "tram", "train", "bus", "cbd", "yarra", "docklands", "st kilda", "geelong", "ballarat", "bendigo", "police", "fire", "ambulance", "road", "freeway", "traffic", "hospital", "墨尔本", "维州", "本地", "民生", "交通", "电车", "火车", "公交", "市中心", "警方", "火警", "救护", "道路", "高速", "拥堵", "医院", "政府", "市政"],
+
+    }
+
+
+    TOPIC_KWS = {
+
+        "au_politics": [
+        "parliament",
+        "senate",
+        "house",
+        "cabinet",
+        "minister",
+        "shadow minister",
+        "opposition",
+        "election",
+        "vote",
+        "ballot",
+        "campaign",
+        "budget",
+        "treasury",
+        "tax",
+        "spending",
+        "funding",
+        "policy",
+        "bill",
+        "law",
+        "laws",
+        "legislation",
+        "reform",
+        "inquiry",
+        "royal commission",
+        "immigration",
+        "visa",
+        "citizenship",
+        "asylum",
+        "home affairs",
+        "national security",
+        "defence",
+        "foreign minister",
+        "议会",
+        "参议院",
+        "众议院",
+        "内阁",
+        "部长",
+        "影子部长",
+        "反对党",
+        "选举",
+        "投票",
+        "竞选",
+        "预算",
+        "财政",
+        "税",
+        "拨款",
+        "政策",
+        "法案",
+        "法律",
+        "立法",
+        "改革",
+        "调查",
+        "移民",
+        "签证",
+        "国籍",
+        "内政",
+        "国防",
+        "外交",
+],
+
+    }
+
+
+    def _passes_anchor_topic(it: dict, strict: bool) -> bool:
+        anchors0 = MUST_ANCHOR.get(key) or []
+        topics0 = TOPIC_KWS.get(key) or []
+        if (not anchors0) and (not topics0):
+            return True
+
+        title0 = it.get("title") or ""
+        sn0 = it.get("snippet") or ""
+        src0 = it.get("source") or ""
+        txt_ts = "{0} {1}".format(title0, sn0)
+        txt_all = "{0} {1} {2}".format(title0, sn0, src0)
+
+        if key == "au_politics":
+            # 只用 title/snippet 做判断，避免 source(Just In) 等导致误命中
+            anchors = []
+            for a in (anchors0 or []):
+                aa = (a or "").strip()
+                if not aa:
+                    continue
+                # 中文锚点保留；英文锚点要求长度>=4，避免 act/vic/wa 这类子串误命中
+                try:
+                    is_cjk = _has_cjk(aa)
+                except Exception:
+                    is_cjk = False
+                if is_cjk:
+                    anchors.append(aa)
+                    continue
+                if len(aa) >= 4:
+                    anchors.append(aa)
+
+            topics = topics0
+            intl_ban = ["bangladesh", "pakistan", "dhaka", "sheikh hasina", "孟加拉", "巴基斯坦", "达卡", "哈西娜", "谢赫"]
+            if _kw_hit(txt_ts, intl_ban):
+                return False
+
+            # au_politics：必须同时满足 AU anchor + politics topic
+            if anchors and (not _kw_hit(txt_ts, anchors)):
+                return False
+            if topics and (not _kw_hit(txt_ts, topics)):
+                return False
+            return True
+
+        # 其它分类：允许 source 参与 anchor 判断（保持原行为）
+        if anchors0 and (not _kw_hit(txt_all, anchors0)):
+            return False
+        return True
+    def _pick(items_in: list, require_wl: bool, need: int, picked: list, seen_titles: set):
+        nonlocal dropped_blacklist, dropped_whitelist, dropped_anchor, dropped_intlban, relax_used
+        # Strict categories: never relax whitelist (keep category clean even if fewer items)
+        try:
+            if key in STRICT_WHITELIST_CATS:
+                require_wl = True
+        except Exception:
+            pass
+        if need <= 0:
+            return
+        for it in (items_in or []):
+            if need <= 0:
+                break
+            if not isinstance(it, dict):
+                continue
+            if not _passes_blacklist(it):
+                dropped_blacklist += 1
+                continue
+            if not _passes_topicban(it):
+                dropped_topicban += 1
+                continue
+            if require_wl and (not _passes_whitelist(it)):
+                dropped_whitelist += 1
+                continue
+            if not _passes_anchor_topic(it, require_wl):
+                continue
+            nt = _norm_title(it.get("title") or "")
+            if nt and nt in seen_titles:
+                continue
+            seen_titles.add(nt)
+            picked.append(it)
+            need -= 1
+
+    prefer = (prefer_lang or "zh").strip().lower()
+    if prefer not in ["zh", "en"]:
+        prefer = "zh"
+
+    zh_items = [x for x in all_items if bool(x.get("is_zh"))]
+    en_items = [x for x in all_items if not bool(x.get("is_zh"))]
+
+    picked = []
+    seen = set()
+
+    if prefer == "zh":
+        _pick(zh_items, True, lim_int - len(picked), picked, seen)
+        _pick(en_items, True, lim_int - len(picked), picked, seen)
+    else:
+        _pick(en_items, True, lim_int - len(picked), picked, seen)
+        _pick(zh_items, True, lim_int - len(picked), picked, seen)
+
+    STRICT_NO_RELAX = {"au_politics"}
+    if len(picked) < lim_int:
+        # For strict categories (e.g. au_politics), do NOT relax whitelist/anchor just to fill.
+        if key in STRICT_NO_RELAX:
+            relax_used = 0
+        else:
+            # Relax whitelist to fill remaining slots
+            relax_used = 1
+            _pick(zh_items, False, lim_int - len(picked), picked, seen)
+            if len(picked) < lim_int:
+                _pick(en_items, False, lim_int - len(picked), picked, seen)
+    if len(picked) < lim_int:
+        # P2: Do NOT backfill with unfiltered items (prevents banned topics leaking back)
+        has_bans = bool(bl) or bool((TOPIC_BANS.get(key) or []))
+        is_strict = False
+        try:
+            is_strict = (key in STRICT_WHITELIST_CATS)
+        except Exception:
+            is_strict = False
+        if (not is_strict) and (not has_bans):
+            # benign categories only: allow soft backfill but still avoid duplicates
+            for it in all_items:
+                if len(picked) >= lim_int:
+                    break
+                nt = _norm_title(it.get("title") or "")
+                if nt and nt in seen:
+                    continue
+                seen.add(nt)
+                picked.append(it)
+        else:
+            # strict or ban-configured categories: only backfill with items that still pass filters
+            for it in all_items:
+                if len(picked) >= lim_int:
+                    break
+                if (not _passes_blacklist(it)):
+                    continue
+                if (not _passes_topicban(it)):
+                    continue
+                if (not _passes_anchor_topic(it, False)):
+                    continue
+                nt = _norm_title(it.get("title") or "")
+                if nt and nt in seen:
+                    continue
+                seen.add(nt)
+                picked.append(it)
+    out_items = picked[:lim_int]
+
+    lines = []
+    for i, it in enumerate(out_items, 1):
+        t = it.get("title") or ""
+        u = it.get("url") or ""
+        src = it.get("source") or ""
+        pa = it.get("published_at") or ""
+        sn = it.get("snippet") or ""
+        lines.append("{0}) {1}".format(i, t))
+        meta = []
+        if src:
+            meta.append(src)
+        if pa:
+            meta.append(pa)
+        if meta:
+            lines.append("   [{0}]".format(" | ".join(meta)))
+        if sn:
+            lines.append("   {0}".format(sn))
+        if u:
+            lines.append("   {0}".format(u))
+
+    ret = {
+        "ok": True,
+        "category": key,
+        "time_range": "24h",
+        "limit": lim_int,
+        "items": out_items,
+        "final": "\n".join(lines).strip(),
+        "query_used": "miniflux category_id={0} after={1} fetch_limit={2}".format(cat_id, after_ts, fetch_lim),
+        "stats": {"fetched": len(all_items), "zh_fetched": len(zh_items), "en_fetched": len(en_items), "returned": len(out_items)},
+        "stats_detail": {"dropped_blacklist": dropped_blacklist, "dropped_whitelist": dropped_whitelist, "dropped_anchor": dropped_anchor, "dropped_intlban": dropped_intlban, "relax_used": relax_used, "dropped_topicban": dropped_topicban},
+        "dropped_topicban": dropped_topicban,
+    }
+
+
+    if ("final_voice" not in ret) or (not str(ret.get("final_voice") or "").strip()):
+        ret["final_voice"] = _news__format_voice_miniflux(ret.get("items") or [], ret.get("limit") or 5)
+    return ret
+
+def _news__norm_host(host: str) -> str:
+    h = (host or "").lower().split(":", 1)[0]
+    for pfx in ("www.", "m.", "amp."):
+        if h.startswith(pfx):
+            h = h[len(pfx):]
+    return h
+
+def _news__match_source(url: str, rules: list) -> bool:
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    host = _news__norm_host(u.netloc)
+    path = u.path or "/"
+    for r in (rules or []):
+        dom = _news__norm_host(r.get("domain") or "")
+        if not dom:
+            continue
+        wildcard = bool(r.get("wildcard"))
+        if wildcard:
+            if host == dom or host.endswith("." + dom):
+                pass
+            else:
+                continue
+        else:
+            if host != dom:
+                continue
+        pfxs = r.get("path_prefixes") or []
+        if pfxs:
+            ok = False
+            for pfx in pfxs:
+                if path.startswith(pfx):
+                    ok = True
+                    break
+            if not ok:
+                continue
+        return True
+    return False
+
+def _news__extract_limit(text: str, default: int = 5) -> int:
+    t = text or ""
+    m = re.search(r"(\d{1,2})\s*(条|則|则|个|篇)", t)
+    if not m:
+        m = re.search(r"top\s*(\d{1,2})", t, flags=re.I)
+    if not m:
+        return default
+    try:
+        n = int(m.group(1))
+    except Exception:
+        return default
+    if n < 1:
+        return 1
+    if n > 10:
+        return 10
+    return n
+
+def _news__time_range_from_text(text: str) -> str:
+    t = text or ""
+    if any(x in t for x in ["本周", "一周", "近一周", "最近一周", "week"]):
+        return "week"
+    return "day"
+
+def _news_category_from_text(text: str) -> str:
+    t = (text or "").lower()
+    if ("墨尔本" in t) or ("melbourne" in t) or ("维州" in t) or ("victoria" in t) or ("本地" in t and "新闻" in t):
+        return "mel_life"
+    if ("澳洲" in t or "澳大利亚" in t or "australia" in t) and ("政治" in t or "议会" in t or "工党" in t or "自由党" in t):
+        return "au_politics"
+    if ("财经" in t) or ("股市" in t) or ("a股" in t) or ("经济" in t and "中国" in t):
+        return "cn_finance"
+    if ("数码" in t) or ("手机" in t) or ("相机" in t) or ("电脑" in t) or ("评测" in t) or ("新品" in t):
+        return "tech_gadgets"
+    if ("互联网" in t) or ("ai" in t) or ("人工智能" in t) or ("开源" in t) or ("科技" in t):
+        return "tech_internet"
+    if ("游戏" in t) or ("steam" in t) or ("ps5" in t) or ("xbox" in t) or ("switch" in t):
+        return "gaming"
+    if ("世界" in t) or ("国际" in t) or ("world" in t):
+        return "world"
+    if "新闻" in t or "要闻" in t:
+        return "world"
+    return "world"
+
+def _is_news_query(text: str) -> bool:
+    t = text or ""
+    if any(k in t for k in ["新闻", "要闻", "资讯", "headline", "headlines"]):
+        return True
+    if any(k in t for k in ["世界", "国际", "澳洲政治", "中国财经", "墨尔本", "维州", "互联网科技", "数码", "游戏新闻"]):
+        return True
+    return False
+
+def _news__cfg() -> dict:
+    # Each source rule: {domain, wildcard?, path_prefixes?}
+    return {
+        "world": {
+            "terms": ["国际", "要闻"],
+            "zh": [
+                {"domain": "thepaper.cn", "wildcard": True},
+                {"domain": "caixin.com", "wildcard": True},
+                {"domain": "ifeng.com", "wildcard": True},
+                {"domain": "bbc.com", "wildcard": True, "path_prefixes": ["/zhongwen", "/zh"]},
+                {"domain": "dw.com", "wildcard": True, "path_prefixes": ["/zh", "/zh-hans"]},
+            ],
+            "en": [
+                {"domain": "reuters.com", "wildcard": True},
+                {"domain": "apnews.com", "wildcard": True},
+                {"domain": "bbc.com", "wildcard": True},
+                {"domain": "theguardian.com", "wildcard": True},
+                {"domain": "aljazeera.com", "wildcard": True},
+            ],
+        },
+        "cn_finance": {
+            "terms": ["中国", "财经", "要闻"],
+            "zh": [
+                {"domain": "caixin.com", "wildcard": True},
+                {"domain": "yicai.com", "wildcard": True},
+            ],
+            "en": [
+                {"domain": "reuters.com", "wildcard": True},
+            ],
+        },
+        "au_politics": {
+            "terms": ["澳洲", "联邦", "政治"],
+            "zh": [
+                {"domain": "sbs.com.au", "wildcard": True, "path_prefixes": ["/language/chinese"]},
+                {"domain": "abc.net.au", "wildcard": True, "path_prefixes": ["/chinese"]},
+            ],
+            "en": [
+                {"domain": "abc.net.au", "wildcard": True},
+                {"domain": "sbs.com.au", "wildcard": True},
+                {"domain": "theguardian.com", "wildcard": True},
+                {"domain": "aph.gov.au", "wildcard": True},
+                {"domain": "parliament.gov.au", "wildcard": True},
+                {"domain": "aec.gov.au", "wildcard": True},
+            ],
+        },
+        "mel_life": {
+            "terms": ["墨尔本", "维州", "民生"],
+            "zh": [
+                {"domain": "sbs.com.au", "wildcard": True, "path_prefixes": ["/language/chinese"]},
+                {"domain": "abc.net.au", "wildcard": True, "path_prefixes": ["/chinese"]},
+            ],
+            "en": [
+                {"domain": "abc.net.au", "wildcard": True},
+                {"domain": "9news.com.au", "wildcard": True},
+                {"domain": "melbourne.vic.gov.au", "wildcard": True},
+            ],
+        },
+        "tech_internet": {
+            "terms": ["互联网", "科技", "AI"],
+            "zh": [
+                {"domain": "36kr.com", "wildcard": True},
+                {"domain": "huxiu.com", "wildcard": True},
+            ],
+            "en": [
+                {"domain": "theverge.com", "wildcard": True},
+                {"domain": "techcrunch.com", "wildcard": True},
+                {"domain": "wired.com", "wildcard": True},
+                {"domain": "arstechnica.com", "wildcard": True},
+            ],
+        },
+        "tech_gadgets": {
+            "terms": ["数码", "新品", "评测"],
+            "zh": [
+                {"domain": "sspai.com", "wildcard": True},
+                {"domain": "ifanr.com", "wildcard": True},
+            ],
+            "en": [
+                {"domain": "theverge.com", "wildcard": True},
+            ],
+        },
+        "gaming": {
+            "terms": ["游戏", "新闻", "Steam"],
+            "zh": [
+                {"domain": "gcores.com", "wildcard": True},
+                {"domain": "ucg.cn", "wildcard": True},
+            ],
+            "en": [
+                {"domain": "ign.com", "wildcard": True},
+                {"domain": "pcgamer.com", "wildcard": True},
+            ],
+        },
+    }
+
+def _news__build_query_rules(terms: list, rules_zh: list, rules_en: list) -> str:
+    words = " ".join([x for x in (terms or []) if x])
+    sites = []
+    def __coerce_list(v):
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        if isinstance(v, str):
+            vv = v.strip()
+            if not vv:
+                return []
+            return [vv]
+        return [v]
+
+    for r in (__coerce_list(rules_zh) + __coerce_list(rules_en)):
+        dom = (r.get("domain") or "").strip()
+        if not dom:
+            continue
+        sites.append("site:" + dom)
+    sites = sorted(list(set(sites)))
+    if sites:
+        return words + " (" + " OR ".join(sites) + ")"
+    return words
+
+def _news__format_final(items: list) -> str:
+    if not items:
+        return "暂无符合来源池的新闻结果。"
+    out_lines = []
+    i = 1
+    for it in items:
+        title = (it.get("title") or "").strip()
+        url = (it.get("url") or "").strip()
+        src = (it.get("source") or "").strip()
+        snip = (it.get("snippet") or "").strip()
+        if not title or not url:
+            continue
+        out_lines.append(str(i) + ") " + title + "（" + src + "）")
+        if snip:
+            out_lines.append("   " + snip)
+        i += 1
+    return "\n".join(out_lines)
+
+@mcp.tool(description="(Tool) News digest for a category and time range")
+def news_digest_legacy_fn_1(category: str = "world", time_range: str = "day", limit: int = 5, prefer_lang: str = "zh", user_text: str = "", **kwargs):
+    cfg = _news__cfg()
+    if category not in cfg:
+        category = "world"
+    if time_range not in ("day", "week"):
+        time_range = "day"
+    if limit is None:
+        limit = 5
+    try:
+        limit_i = int(limit)
+    except Exception:
+        limit_i = 5
+    if limit_i < 1:
+        limit_i = 1
+    if limit_i > 10:
+        limit_i = 10
+
+    terms = cfg[category].get("terms") or []
+    rules_zh = cfg[category].get("zh") or []
+    rules_en = cfg[category].get("en") or []
+
+    recency_hint = " 今天" if time_range == "day" else " 本周"
+    q = _news__build_query_rules(terms, rules_zh, rules_en) + recency_hint
+    r = web_search(q, k=max(20, limit_i * 6), categories="general")
+    results = (r.get("results") or []) if isinstance(r, dict) else []
+
+    items_all = []
+    seen = set()
+    for it in results:
+        url = (it.get("url") or "").strip()
+        title = (it.get("title") or "").strip()
+        if not url or not title:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        items_all.append(it)
+
+    picked = []
+    for it in items_all:
+        if _news__match_source(it.get("url"), rules_zh):
+            picked.append(it)
+            if len(picked) >= limit_i:
+                break
+
+    if len(picked) < limit_i:
+        for it in items_all:
+            if _news__match_source(it.get("url"), rules_en):
+                if it in picked:
+                    continue
+                picked.append(it)
+                if len(picked) >= limit_i:
+                    break
+
+    query_used = q
+    if not picked and time_range == "day":
+        q2 = _news__build_query_rules(terms, rules_zh, rules_en) + " 本周"
+        r2 = web_search(q2, k=max(20, limit_i * 6), categories="general")
+        results2 = (r2.get("results") or []) if isinstance(r2, dict) else []
+        items2 = []
+        seen2 = set()
+        for it in results2:
+            url = (it.get("url") or "").strip()
+            title = (it.get("title") or "").strip()
+            if not url or not title:
+                continue
+            if url in seen2:
+                continue
+            seen2.add(url)
+            items2.append(it)
+        for it in items2:
+            if _news__match_source(it.get("url"), rules_zh):
+                picked.append(it)
+                if len(picked) >= limit_i:
+                    break
+        if len(picked) < limit_i:
+            for it in items2:
+                if _news__match_source(it.get("url"), rules_en):
+                    if it in picked:
+                        continue
+                    picked.append(it)
+                    if len(picked) >= limit_i:
+                        break
+        query_used = q2
+        if picked:
+            time_range = "week"
+
+    out_items = []
+    for it in picked:
+        out_items.append({
+            "title": it.get("title"),
+            "url": it.get("url"),
+            "snippet": it.get("snippet") or it.get("content") or "",
+            "source": it.get("source") or _news__norm_host(urlparse(it.get("url") or "").netloc),
+            "lang": it.get("lang") or "",
+        })
+
+    final = _news__format_final(out_items)
+    return {
+        "ok": True,
+        "category": category,
+        "time_range": time_range,
+        "limit": limit_i,
+        "final": final,
+        "items": out_items,
+        "query_used": query_used,
+    }
+
+# NEWS_DIGEST_V3_END
+# ===============================
+
+@mcp.tool(description="(Router) Route natural language request into structured weather/calendar/holiday/state. Entry tool for HA.")
+def route_request(text: str) -> dict:
+    user_text = str(text or "").strip()
+    if not user_text:
+        return {"ok": True, "route_type": "open_domain", "final": "", "hint": "empty text"}
+
+    # entity_id state
+    if _looks_like_entity_id(user_text):
+        r = ha_get_state(user_text)
+        if not r.get("ok"):
+            return {"ok": True, "route_type": "structured_state", "final": "我现在联网查询失败了，请稍后再试。", "data": r}
+        data = r.get("data") or {}
+        st = str(data.get("state") or "").strip()
+        return {"ok": True, "route_type": "structured_state", "final": "实体 " + user_text + " 状态: " + st + "。", "data": r, "entity_id": user_text}
+
+    # holiday
+    if _is_holiday_query(user_text):
+        m = re.search(r"(20\d{2})", user_text)
+        y = None
+        if m:
+            try:
+                y = int(m.group(1))
+            except Exception:
+                y = None
+        now = _now_local()
+        if y is None:
+            try:
+                y = int(getattr(now, "year"))
+            except Exception:
+                y = 2026
+        rr = holiday_vic(y)
+        if not rr.get("ok"):
+            return {"ok": True, "route_type": "structured_holiday", "final": "假期查询失败。", "data": rr}
+        items = rr.get("holidays") or []
+        today_d = dt_date(now.year, now.month, now.day)
+        today_s = str(today_d)
+
+        t = str(user_text or "")
+        want_next = ("下一个" in t) or ("下個" in t) or ("next" in t.lower())
+        want_recent = ("最近" in t) or ("上一个" in t) or ("上個" in t) or ("刚刚" in t) or ("剛剛" in t)
+
+        if want_next:
+            nx = _holiday_next_from_list(items, today_s)
+            if not nx.get("ok"):
+                final = "未找到下一个维州公众假期。"
+                return {"ok": True, "route_type": "structured_holiday", "final": final, "data": rr}
+            days = nx.get("days")
+            if isinstance(days, int):
+                final = "下一个维州公众假期：" + str(nx.get("name") or "") + "（" + str(nx.get("date") or "") + "，" + str(days) + " 天后）"
+            else:
+                final = "下一个维州公众假期：" + str(nx.get("name") or "") + "（" + str(nx.get("date") or "") + "）"
+            return {"ok": True, "route_type": "structured_holiday", "final": final, "data": rr, "next": nx}
+
+        if want_recent:
+            pv = _holiday_prev_from_list(items, today_s)
+            if not pv.get("ok"):
+                final = "未找到最近的维州公众假期。"
+                return {"ok": True, "route_type": "structured_holiday", "final": final, "data": rr}
+            da = pv.get("days_ago")
+            if isinstance(da, int):
+                final = "最近的维州公众假期：" + str(pv.get("name") or "") + "（" + str(pv.get("date") or "") + "，" + str(da) + " 天前）"
+            else:
+                final = "最近的维州公众假期：" + str(pv.get("name") or "") + "（" + str(pv.get("date") or "") + "）"
+            return {"ok": True, "route_type": "structured_holiday", "final": final, "data": rr, "recent": pv}
+
+        return {"ok": True, "route_type": "structured_holiday", "final": "已获取维州公众假期（AU-VIC），年份 " + str(y) + "，共 " + str(len(items)) + " 天。", "data": rr}
+    if _is_weather_query(user_text):
+        eid = str(os.environ.get("HA_DEFAULT_WEATHER_ENTITY") or "").strip()
+        if not eid:
+            return {"ok": True, "route_type": "structured_weather", "final": "未配置默认天气实体。请设置环境变量 HA_DEFAULT_WEATHER_ENTITY。", "error": "missing_default_weather_entity"}
+        tzinfo = _tzinfo()
+        now = _now_local()
+        base_d = dt_date(now.year, now.month, now.day)
+
+        q = _weather_range_from_text(user_text, now_local=now)
+        rr = ha_weather_forecast(eid, "daily")
+        if not rr.get("ok"):
+            return {"ok": True, "route_type": "structured_weather", "final": "我现在联网查询失败了，请稍后再试。", "data": rr}
+        fc = rr.get("forecast") if isinstance(rr.get("forecast"), list) else []
+        label = str((q.get("label") or "")).strip()
+
+        # compute available local-date bounds from forecast list
+        avail = []
+        if isinstance(fc, list):
+            for it in fc:
+                d = _local_date_from_forecast_item(it, tzinfo)
+                if d is None:
+                    continue
+                if d not in avail:
+                    avail.append(d)
+        try:
+            avail = sorted(avail)
+        except Exception:
+            pass
+        min_d = avail[0] if isinstance(avail, list) and len(avail) > 0 else None
+        max_d = avail[-1] if isinstance(avail, list) and len(avail) > 0 else None
+
+        head = ""  # removed weather entity prefix
+        if q.get("mode") == "range":
+            start_d = q.get("start_date")
+            if not isinstance(start_d, dt_date):
+                start_d = base_d
+            days_req = _safe_int(q.get("days"), 3)
+            if days_req < 1:
+                days_req = 1
+            days_i = days_req
+            if days_i > 6:
+                days_i = 6
+
+            note = ""
+            # note for user-requested truncation (plugin capability)
+            if days_req != days_i:
+                note = "（注意：该天气插件仅提供当天及未来5天，共6天预报）"
+
+            # if actual forecast max date is earlier, clip again and override note
+            if isinstance(max_d, dt_date):
+                try:
+                    from datetime import timedelta
+                    end_req = start_d + timedelta(days=days_i - 1)
+                except Exception:
+                    end_req = None
+                if isinstance(end_req, dt_date) and end_req > max_d:
+                    note = "（注意：该天气插件仅提供到 " + str(max_d) + " 的预报）"
+                    try:
+                        days_i2 = (max_d - start_d).days + 1
+                    except Exception:
+                        days_i2 = days_i
+                    if isinstance(days_i2, int) and days_i2 >= 1:
+                        days_i = days_i2
+
+            # display label correction when user asked for >6 days
+            label_show = label
+            if label_show and ("接下来" in label_show) and (days_req != days_i):
+                # keep simple: rebuild the label
+                if "天气" in label_show:
+                    label_show = "接下来" + str(days_i) + "天天气"
+                else:
+                    label_show = "接下来" + str(days_i) + "天"
+
+            summary = _summarise_weather_range(fc, start_d, days_i, tzinfo)
+            if label_show:
+                final = head + label_show + "：" + summary + note
+            else:
+                final = head + "未来" + str(days_i) + "天天气：" + summary + note
+            return {"ok": True, "route_type": "structured_weather", "final": final, "data": rr}
+
+        off = _safe_int(q.get("offset"), 0)
+        td = q.get("target_date")
+        if not isinstance(td, dt_date):
+            td = base_d
+            try:
+                from datetime import timedelta
+                td = base_d + timedelta(days=off)
+            except Exception:
+                td = base_d
+
+        it = _pick_daily_forecast_by_local_date(fc, td, tzinfo)
+        if it is None:
+            if isinstance(min_d, dt_date) and isinstance(max_d, dt_date):
+                final = head + (label + "：无预报。" if label else "天气：无预报。") + "（可用范围：" + str(min_d) + " 到 " + str(max_d) + "）"
+            else:
+                final = head + (label + "：无预报。" if label else "天气：无预报。") + "（该天气插件通常仅提供当天及未来5天）"
+        else:
+            final = head + (label + "：" if label else "天气：") + _summarise_weather_item(it)
+        return {"ok": True, "route_type": "structured_weather", "final": final, "data": rr}
+    if _is_calendar_query(user_text):
+        cal = str(os.environ.get("HA_DEFAULT_CALENDAR_ENTITY") or "").strip()
+        if not cal:
+            return {"ok": True, "route_type": "structured_calendar", "final": "未配置默认日历实体。请设置环境变量 HA_DEFAULT_CALENDAR_ENTITY。", "error": "missing_default_calendar_entity"}
+        tzinfo = _tzinfo()
+        now = _now_local()
+        base_d = dt_date(now.year, now.month, now.day)
+
+        q = _calendar_range_from_text(user_text, now_local=now)
+        mode = q.get("mode") or "single"
+        label = str((q.get("label") or "")).strip()
+
+        if mode == "range":
+            start_d = q.get("start_date")
+            end_d = q.get("end_date")
+            if not isinstance(start_d, dt_date):
+                start_d = base_d
+
+            if isinstance(end_d, dt_date):
+                try:
+                    from datetime import timedelta
+                    end_excl = end_d + timedelta(days=1)
+                except Exception:
+                    end_excl = end_d
+                s_iso, _ = _iso_day_start_end(start_d, tzinfo)
+                e_iso, _ = _iso_day_start_end(end_excl, tzinfo)
+            else:
+                days_i = _safe_int(q.get("days"), 3)
+                if days_i < 1:
+                    days_i = 1
+                if days_i > 14:
+                    days_i = 14
+                try:
+                    from datetime import timedelta
+                    end_excl_d = start_d + timedelta(days=days_i)
+                except Exception:
+                    end_excl_d = start_d
+                s_iso, _ = _iso_day_start_end(start_d, tzinfo)
+                e_iso, _ = _iso_day_start_end(end_excl_d, tzinfo)
+
+            rr = ha_calendar_events(cal, s_iso, e_iso)
+            if not rr.get("ok"):
+                return {"ok": True, "route_type": "structured_calendar", "final": "我现在联网查询失败了，请稍后再试。", "data": rr}
+            ev = rr.get("data") if isinstance(rr.get("data"), list) else []
+            head = (label + "有 " + str(len(ev)) + " 条日程：" if label else "共有 " + str(len(ev)) + " 条日程：")
+            final = head + _summarise_calendar_events(ev)
+            return {"ok": True, "route_type": "structured_calendar", "final": final, "data": rr, "range": {"start": s_iso, "end": e_iso}}
+
+        td = q.get("target_date")
+        if not isinstance(td, dt_date):
+            off = _safe_int(q.get("offset"), 0)
+            try:
+                from datetime import timedelta
+                td = base_d + timedelta(days=off)
+            except Exception:
+                td = base_d
+        s_iso, e_iso = _iso_day_start_end(td, tzinfo)
+        rr = ha_calendar_events(cal, s_iso, e_iso)
+        if not rr.get("ok"):
+            return {"ok": True, "route_type": "structured_calendar", "final": "我现在联网查询失败了，请稍后再试。", "data": rr}
+        ev = rr.get("data") if isinstance(rr.get("data"), list) else []
+        if len(ev) == 0:
+            final = (label + "没有日程。" if label else "没有日程。")
+        else:
+            final = (label + "有 " + str(len(ev)) + " 条日程：" if label else "有 " + str(len(ev)) + " 条日程：") + _summarise_calendar_events(ev)
+        return {"ok": True, "route_type": "structured_calendar", "final": final, "data": rr, "range": {"start": s_iso, "end": e_iso}}
+
+    # news digest (semi-structured retrieval)
+    if _news__is_query(user_text):
+        cat = _news__category_from_text(user_text)
+        tr = _news__time_range_from_text(user_text)
+        rrn = news_digest(category=cat, limit=_news__extract_limit(user_text, 3), time_range=tr, prefer_lang="zh", user_text=user_text)
+        if rrn.get("ok") and str(rrn.get("final") or "").strip():
+            final = rrn.get("final_voice") or rrn.get("final") or ""
+            return {"ok": True, "route_type": "semi_structured_news", "final": final, "data": rrn}
+        return {"ok": True, "route_type": "semi_structured_news", "final": "新闻检索失败或暂无结果。", "data": rrn}
+
+    # Semi-structured retrieval: news digest
+    if _is_news_query(user_text):
+        cat = _news_category_from_text(user_text)
+        tr = _news__time_range_from_text(user_text)
+        lim = _news__extract_limit(user_text, 3)
+        data = news_digest(category=cat, time_range=tr, limit=_news__extract_limit(user_text, 3))
+        final = (data.get("final_voice") or data.get("final") or "") if isinstance(data, dict) else ""
+        if not final:
+            final = "暂无符合来源池的新闻结果。"
+        return {"ok": True, "route_type": "semi_structured_news", "final": final, "data": data}
+
+    return {"ok": True, "route_type": "open_domain", "final": "开放域问题：请直接提问（例如：解释某个概念、某个事件的背景）。"}
+
+@mcp.tool(description="(Debug) Return enabled tools and key env configuration for self-check.")
+def tools_selfcheck() -> dict:
+    out = {
+        "ok": True,
+        "service": "mcp-hello",
+        "port": os.environ.get("PORT") or os.environ.get("MCP_PORT") or "19090",
+        "TZ": os.environ.get("TZ") or "",
+        "HA_BASE_URL": os.environ.get("HA_BASE_URL") or "",
+        "HA_DEFAULT_WEATHER_ENTITY": os.environ.get("HA_DEFAULT_WEATHER_ENTITY") or "",
+        "HA_DEFAULT_CALENDAR_ENTITY": os.environ.get("HA_DEFAULT_CALENDAR_ENTITY") or "",
+        "note": "If container shows Restarting (0), app.py had no __main__/server entrypoint.",
+    }
+    return out
+
+def _build_asgi_app_from_mcp():
+    try:
+        a = getattr(mcp, "app", None)
+        if a is not None:
+            return a
+    except Exception:
+        pass
+    for nm in ["asgi_app", "get_asgi_app", "sse_app", "get_app", "create_app"]:
+        try:
+            fn = getattr(mcp, nm, None)
+            if fn is None:
+                continue
+            if callable(fn):
+                try:
+                    return fn()
+                except TypeError:
+                    return fn
+        except Exception:
+            continue
+    return None
+
+if __name__ == "__main__":
+    host = os.environ.get("HOST") or "0.0.0.0"
+    port = _safe_int(os.environ.get("PORT") or os.environ.get("MCP_PORT") or "19090", 19090)
+
+    # In Docker/HA MCP Server usage, we want an HTTP(SSE/ASGI) server.
+    # Do NOT call mcp.run() here (it may default to STDIO and exit cleanly in containers).
+    asgi = _build_asgi_app_from_mcp()
+    if asgi is None:
+        raise RuntimeError("Cannot build ASGI app from FastMCP. FastMCP API mismatch.")
+
+    import uvicorn
+    uvicorn.run(asgi, host=host, port=port)
+

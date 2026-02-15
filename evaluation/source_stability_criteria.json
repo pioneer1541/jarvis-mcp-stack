@@ -1,0 +1,12 @@
+{
+  "thresholds": {
+    "news_timeout_rate_max": 0.1,
+    "news_empty_rate_max": 0.2,
+    "finance_timeout_rate_max": 0.1,
+    "finance_noanswer_rate_max": 0.3
+  },
+  "notes": [
+    "news_empty_rate means facts list empty in news_brief response.",
+    "finance_noanswer_rate means final_text missing or too short in answer_question response for finance cases."
+  ]
+}

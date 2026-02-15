@@ -1,0 +1,391 @@
+{
+  "summary": {
+    "total": 30,
+    "errors": 0,
+    "route_news": 30,
+    "facts_ge_2": 27
+  },
+  "rows": [
+    {
+      "id": 1,
+      "query": "今天墨尔本本地新闻三条",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天墨尔本本地新闻三条」相关的新闻，先读 3 条。 重点包括：Perth festival opens with stories 'of the heart' shared via old red phone；Bezos could have saved The Washington Post’s local news and sports reporters；Bouncer brothers avoid jail for 'chilling' Scarborough bar assault。",
+      "facts": [
+        "Perth festival opens with stories 'of the heart' shared via old red phone",
+        "Bezos could have saved The Washington Post’s local news and sports reporters",
+        "Bouncer brothers avoid jail for 'chilling' Scarborough bar assault"
+      ]
+    },
+    {
+      "id": 2,
+      "query": "今天本地热点",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天本地热点」相关的新闻，先读 3 条。 重点包括：No body-camera footage of woman's death in police stand-off, coroner hears；Perth festival opens with stories 'of the heart' shared via old red phone；Bezos could have saved The Washington Post’s local news and sports reporters。",
+      "facts": [
+        "No body-camera footage of woman's death in police stand-off, coroner hears",
+        "Perth festival opens with stories 'of the heart' shared via old red phone",
+        "Bezos could have saved The Washington Post’s local news and sports reporters"
+      ]
+    },
+    {
+      "id": 3,
+      "query": "今天世界热点",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天世界热点」相关的新闻，先读 3 条。 重点包括：AliExpress Has Imported Nintendo Switch 2 Mario Kart World Tour Console Bundles for $458；Subnautica 2 devs show off multiplayer while constantly reassuring solo players it's totally optional；Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000。",
+      "facts": [
+        "AliExpress Has Imported Nintendo Switch 2 Mario Kart World Tour Console Bundles for $458",
+        "Subnautica 2 devs show off multiplayer while constantly reassuring solo players it's totally optional",
+        "Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000"
+      ]
+    },
+    {
+      "id": 4,
+      "query": "今天科技热点",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天科技热点」相关的新闻，先读 3 条。 重点包括：苹果的 Magic，究竟在何处？；No body-camera footage of woman's death in police stand-off, coroner hears；‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland。",
+      "facts": [
+        "苹果的 Magic，究竟在何处？",
+        "No body-camera footage of woman's death in police stand-off, coroner hears",
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland"
+      ]
+    },
+    {
+      "id": 5,
+      "query": "今天财经热点",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天财经热点」相关的新闻，先读 3 条。 重点包括：Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000；Bouncer brothers avoid jail for 'chilling' Scarborough bar assault；Father of pro-democracy activist Anna Kwok first to be convicted under Hong Kong national security law。",
+      "facts": [
+        "Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000",
+        "Bouncer brothers avoid jail for 'chilling' Scarborough bar assault",
+        "Father of pro-democracy activist Anna Kwok first to be convicted under Hong Kong national security law"
+      ]
+    },
+    {
+      "id": 6,
+      "query": "今天体育热点",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「今天体育热点」相关的新闻，先读 3 条。 重点包括：Bezos could have saved The Washington Post’s local news and sports reporters；No body-camera footage of woman's death in police stand-off, coroner hears；Bouncer brothers avoid jail for 'chilling' Scarborough bar assault。",
+      "facts": [
+        "Bezos could have saved The Washington Post’s local news and sports reporters",
+        "No body-camera footage of woman's death in police stand-off, coroner hears",
+        "Bouncer brothers avoid jail for 'chilling' Scarborough bar assault"
+      ]
+    },
+    {
+      "id": 7,
+      "query": "今天交通新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 3 条和「今天交通新闻」相关的新闻，先读 3 条。 重点包括：Today’s Best Deals: Metaphor: ReFantazio Hits New Low, MTG x Avatar Commander’s Bundle, and More；The next Arc Raiders update adds Solo vs Squad matchmaking for PvP masochists and an exciting new map condition: Birds；'We Know There's a Lot of Eyes on Us After Our Game Awards Trailer' — as Highguard Goes Live, Dev Insists 'We're in This for the Long Haul'。",
+      "facts": [
+        "Today’s Best Deals: Metaphor: ReFantazio Hits New Low, MTG x Avatar Commander’s Bundle, and More",
+        "The next Arc Raiders update adds Solo vs Squad matchmaking for PvP masochists and an exciting new map condition: Birds",
+        "'We Know There's a Lot of Eyes on Us After Our Game Awards Trailer' — as Highguard Goes Live, Dev Insists 'We're in This for the Long Haul'"
+      ]
+    },
+    {
+      "id": 8,
+      "query": "墨尔本交通新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「墨尔本交通新闻」相关的新闻，先读 3 条。 重点包括：Bouncer brothers avoid jail for 'chilling' Scarborough bar assault；Dinosaur bones discovered during dig in Victoria's south-east；Father of pro-democracy activist Anna Kwok first to be convicted under Hong Kong national security law。",
+      "facts": [
+        "Bouncer brothers avoid jail for 'chilling' Scarborough bar assault",
+        "Dinosaur bones discovered during dig in Victoria's south-east",
+        "Father of pro-democracy activist Anna Kwok first to be convicted under Hong Kong national security law"
+      ]
+    },
+    {
+      "id": 9,
+      "query": "维州铁路新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「维州铁路新闻」相关的新闻，先读 3 条。 重点包括：Queensland e-scooter injuries escalate to five per day；Next fight looms after Qld government loses appeal in battle for sacred springs；Man convicted of first-degree murder is first to be executed by Florida in 2026。",
+      "facts": [
+        "Queensland e-scooter injuries escalate to five per day",
+        "Next fight looms after Qld government loses appeal in battle for sacred springs",
+        "Man convicted of first-degree murder is first to be executed by Florida in 2026"
+      ]
+    },
+    {
+      "id": 10,
+      "query": "澳洲房产新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「澳洲房产新闻」相关的新闻，先读 3 条。 重点包括：PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra；WA records nation's biggest surge in rental prices over past five years；‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland。",
+      "facts": [
+        "PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra",
+        "WA records nation's biggest surge in rental prices over past five years",
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland"
+      ]
+    },
+    {
+      "id": 11,
+      "query": "澳洲经济新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「澳洲经济新闻」相关的新闻，先读 3 条。 重点包括：PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra；‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland；New engines, no DRS and other important changes to Formula 1 in 2026。",
+      "facts": [
+        "PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra",
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland",
+        "New engines, no DRS and other important changes to Formula 1 in 2026"
+      ]
+    },
+    {
+      "id": 12,
+      "query": "澳洲利率新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「澳洲利率新闻」相关的新闻，先读 3 条。 重点包括：‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland；Bitter taste: per-unit pricing of Australian supermarket fruit and veg leaving customers out of pocket；New engines, no DRS and other important changes to Formula 1 in 2026。",
+      "facts": [
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland",
+        "Bitter taste: per-unit pricing of Australian supermarket fruit and veg leaving customers out of pocket",
+        "New engines, no DRS and other important changes to Formula 1 in 2026"
+      ]
+    },
+    {
+      "id": 13,
+      "query": "RBA 新闻",
+      "route": "news",
+      "facts_count": 2,
+      "sources_count": 2,
+      "final_text": "我找到 2 条和「RBA 新闻」相关的新闻，先读 3 条。 重点包括：A hot economy? RBA’s rate hike justification is hard to swallow for Australians struggling with cost-of-living crisis；Most experts think the RBA will hike the cash rate. Here’s why that may not be a good idea。",
+      "facts": [
+        "A hot economy? RBA’s rate hike justification is hard to swallow for Australians struggling with cost-of-living crisis",
+        "Most experts think the RBA will hike the cash rate. Here’s why that may not be a good idea"
+      ]
+    },
+    {
+      "id": 14,
+      "query": "AI新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「AI新闻」相关的新闻，先读 3 条。 重点包括：iPhone 18 Pro and iPhone 18 Pro Max pricing leak brings some good news；Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000；The 10 Best Funny Games。",
+      "facts": [
+        "iPhone 18 Pro and iPhone 18 Pro Max pricing leak brings some good news",
+        "Save $750 Off the Acer Predator Helios RTX 5090 Gaming Laptop, Now Well Below $3,000",
+        "The 10 Best Funny Games"
+      ]
+    },
+    {
+      "id": 15,
+      "query": "OpenAI 新闻",
+      "route": "news",
+      "facts_count": 2,
+      "sources_count": 2,
+      "final_text": "我找到 2 条和「OpenAI 新闻」相关的新闻，先读 3 条。 重点包括：OpenAI policy exec who opposed chatbot’s “adult mode” reportedly fired on discrimination claim；ChatGPT’s deep research tool adds a built-in document viewer so you can read its reports。",
+      "facts": [
+        "OpenAI policy exec who opposed chatbot’s “adult mode” reportedly fired on discrimination claim",
+        "ChatGPT’s deep research tool adds a built-in document viewer so you can read its reports"
+      ]
+    },
+    {
+      "id": 16,
+      "query": "NVIDIA 新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「NVIDIA 新闻」相关的新闻，先读 3 条。 重点包括：Siemens CEO Roland Busch’s mission to automate everything；'Credible and reliable contacts' claim Nvidia is releasing an RTX 5090-beating GPU around September time this year；That Resident Evil: Requiem Nintendo Switch 2 Trailer Shows That It'll Be Awesome For Budget PCs。",
+      "facts": [
+        "Siemens CEO Roland Busch’s mission to automate everything",
+        "'Credible and reliable contacts' claim Nvidia is releasing an RTX 5090-beating GPU around September time this year",
+        "That Resident Evil: Requiem Nintendo Switch 2 Trailer Shows That It'll Be Awesome For Budget PCs"
+      ]
+    },
+    {
+      "id": 17,
+      "query": "苹果公司新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「苹果公司新闻」相关的新闻，先读 3 条。 重点包括：Orange is the new black: Apple's record-breaking iPhone sales could be down to new color；Save $40 Off a Brand New Pair of Apple AirPods Pro 3 Noise Canceling Earbuds for Valentines Day；Canada shooting: 10 dead including suspect in attack on Tumbler Ridge high school and residence, police say。",
+      "facts": [
+        "Orange is the new black: Apple's record-breaking iPhone sales could be down to new color",
+        "Save $40 Off a Brand New Pair of Apple AirPods Pro 3 Noise Canceling Earbuds for Valentines Day",
+        "Canada shooting: 10 dead including suspect in attack on Tumbler Ridge high school and residence, police say"
+      ]
+    },
+    {
+      "id": 18,
+      "query": "特斯拉新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「特斯拉新闻」相关的新闻，先读 3 条。 重点包括：Epstein engineered intimate relationship for Tesla’s Kimbal Musk, emails show；Former Tesla product manager wants to make luxury goods impossible to fake, starting with a chip；Tesla slipped behind VW in European EV sales last year。",
+      "facts": [
+        "Epstein engineered intimate relationship for Tesla’s Kimbal Musk, emails show",
+        "Former Tesla product manager wants to make luxury goods impossible to fake, starting with a chip",
+        "Tesla slipped behind VW in European EV sales last year"
+      ]
+    },
+    {
+      "id": 19,
+      "query": "比特币新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「比特币新闻」相关的新闻，先读 3 条。 重点包括：苹果的 Magic，究竟在何处？；‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland；Bitter taste: per-unit pricing of Australian supermarket fruit and veg leaving customers out of pocket。",
+      "facts": [
+        "苹果的 Magic，究竟在何处？",
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland",
+        "Bitter taste: per-unit pricing of Australian supermarket fruit and veg leaving customers out of pocket"
+      ]
+    },
+    {
+      "id": 20,
+      "query": "黄金市场新闻",
+      "route": "news",
+      "facts_count": 1,
+      "sources_count": 1,
+      "final_text": "我找到 1 条和「黄金市场新闻」相关的新闻，先读 3 条。 重点是：Black Ops 7's new best mode is a returning classic。如需细看我可以展开。",
+      "facts": [
+        "Black Ops 7's new best mode is a returning classic"
+      ]
+    },
+    {
+      "id": 21,
+      "query": "中澳关系新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「中澳关系新闻」相关的新闻，先读 3 条。 重点包括：PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra；US sanctions officials from Marshall Islands and Palau, citing China fears；‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland。",
+      "facts": [
+        "PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra",
+        "US sanctions officials from Marshall Islands and Palau, citing China fears",
+        "‘A cultural icon’: axed Australian literary journal Meanjin finds new life in Queensland"
+      ]
+    },
+    {
+      "id": 22,
+      "query": "中国新闻",
+      "route": "news",
+      "facts_count": 1,
+      "sources_count": 1,
+      "final_text": "我找到 1 条和「中国新闻」相关的新闻，先读 3 条。 重点是：US sanctions officials from Marshall Islands and Palau, citing China fears。如需细看我可以展开。",
+      "facts": [
+        "US sanctions officials from Marshall Islands and Palau, citing China fears"
+      ]
+    },
+    {
+      "id": 23,
+      "query": "美国大选新闻",
+      "route": "news",
+      "facts_count": 2,
+      "sources_count": 2,
+      "final_text": "我找到 2 条和「美国大选新闻」相关的新闻，先读 3 条。 重点包括：Venezuela’s National Assembly chief rules out new presidential election；‘Women’s freedoms are at stake’: concern at rise of Islamist party before Bangladesh election。",
+      "facts": [
+        "Venezuela’s National Assembly chief rules out new presidential election",
+        "‘Women’s freedoms are at stake’: concern at rise of Islamist party before Bangladesh election"
+      ]
+    },
+    {
+      "id": 24,
+      "query": "乌克兰新闻",
+      "route": "news",
+      "facts_count": 1,
+      "sources_count": 1,
+      "final_text": "我找到 1 条和「乌克兰新闻」相关的新闻，先读 3 条。 重点是：Russia-Ukraine war: List of key events, day 1,448。如需细看我可以展开。",
+      "facts": [
+        "Russia-Ukraine war: List of key events, day 1,448"
+      ]
+    },
+    {
+      "id": 25,
+      "query": "以色列新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 3 条和「以色列新闻」相关的新闻，先读 3 条。 重点包括：Palestine urges ‘powerful partners’ to stop Israel’s West Bank ‘annexation’；Will Israel annex the occupied West Bank?；PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra。",
+      "facts": [
+        "Palestine urges ‘powerful partners’ to stop Israel’s West Bank ‘annexation’",
+        "Will Israel annex the occupied West Bank?",
+        "PM tells Isaac Herzog Australia wants transparency over Zomi Frankcom’s death as pair meet in Canberra"
+      ]
+    },
+    {
+      "id": 26,
+      "query": "气候变化新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 4 条和「气候变化新闻」相关的新闻，先读 3 条。 重点包括：Trump to repeal key ruling allowing regulation of planet-heating gases；New engines, no DRS and other important changes to Formula 1 in 2026；‘Unsustainable’ gaps in policing of franchise businesses must end, MPs say。",
+      "facts": [
+        "Trump to repeal key ruling allowing regulation of planet-heating gases",
+        "New engines, no DRS and other important changes to Formula 1 in 2026",
+        "‘Unsustainable’ gaps in policing of franchise businesses must end, MPs say"
+      ]
+    },
+    {
+      "id": 27,
+      "query": "教育新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「教育新闻」相关的新闻，先读 3 条。 重点包括：English secondary schools must offer inclusion areas for neurodiverse and Send pupils；Canada school shooting live: 10 dead in British Columbia’s Tumbler Ridge；Canada shooting: 10 dead including suspect in attack on Tumbler Ridge high school and residence, police say。",
+      "facts": [
+        "English secondary schools must offer inclusion areas for neurodiverse and Send pupils",
+        "Canada school shooting live: 10 dead in British Columbia’s Tumbler Ridge",
+        "Canada shooting: 10 dead including suspect in attack on Tumbler Ridge high school and residence, police say"
+      ]
+    },
+    {
+      "id": 28,
+      "query": "医疗新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「医疗新闻」相关的新闻，先读 3 条。 重点包括：Doctor previously banned from complex surgery in NSW given senior clinical safety role with Queensland Health；Faces of Death Is Getting the Steelbook Collector’s Edition Treatment；Tuesday briefing: The ‘life-shattering’ stories of Epstein survivors。",
+      "facts": [
+        "Doctor previously banned from complex surgery in NSW given senior clinical safety role with Queensland Health",
+        "Faces of Death Is Getting the Steelbook Collector’s Edition Treatment",
+        "Tuesday briefing: The ‘life-shattering’ stories of Epstein survivors"
+      ]
+    },
+    {
+      "id": 29,
+      "query": "犯罪新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「犯罪新闻」相关的新闻，先读 3 条。 重点包括：Mewgenics Review；AU Deals: Devastating Price Cuts, Long Plays Ahoy, Zero Regret Purchases Aplenty；The Epstein files。",
+      "facts": [
+        "Mewgenics Review",
+        "AU Deals: Devastating Price Cuts, Long Plays Ahoy, Zero Regret Purchases Aplenty",
+        "The Epstein files"
+      ]
+    },
+    {
+      "id": 30,
+      "query": "Doncaster East 本地新闻",
+      "route": "news",
+      "facts_count": 3,
+      "sources_count": 3,
+      "final_text": "我找到 5 条和「Doncaster East 本地新闻」相关的新闻，先读 3 条。 重点包括：Canada school shooting live: 10 dead in British Columbia’s Tumbler Ridge；Dinosaur bones discovered during dig in Victoria's south-east；Antigovernment protests in Albania turn violent, at least 13 arrested。",
+      "facts": [
+        "Canada school shooting live: 10 dead in British Columbia’s Tumbler Ridge",
+        "Dinosaur bones discovered during dig in Victoria's south-east",
+        "Antigovernment protests in Albania turn violent, at least 13 arrested"
+      ]
+    }
+  ]
+}

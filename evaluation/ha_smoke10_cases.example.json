@@ -1,0 +1,67 @@
+{
+  "agent_id": "conversation.ollama_conversation",
+  "language": "zh-CN",
+  "cases": [
+    {
+      "id": "time_now",
+      "topic": "datetime",
+      "text": "现在几点？用一句话回答。",
+      "must_any": [":", "点"]
+    },
+    {
+      "id": "date_today",
+      "topic": "datetime",
+      "text": "今天几号？用一句话回答（YYYY-MM-DD）。",
+      "must_any": ["202", "-"]
+    },
+    {
+      "id": "weather_today",
+      "topic": "weather",
+      "text": "今天天气如何？给最高最低温和是否下雨。",
+      "must_any": ["°C", "最高", "最低", "下雨", "降雨"]
+    },
+    {
+      "id": "calendar_today",
+      "topic": "calendar",
+      "text": "我今天有什么日程？如果没有就说没有。",
+      "must_any": ["日程", "安排", "没有"]
+    },
+    {
+      "id": "holiday_next",
+      "topic": "holiday",
+      "text": "下一个公众假期是哪天？只要日期+假期名。",
+      "must_any": ["202", "假期"]
+    },
+    {
+      "id": "news_hot5",
+      "topic": "news",
+      "text": "给我5条热门新闻标题，按1-5编号输出。",
+      "must_all": ["1", "2", "3", "4", "5"]
+    },
+    {
+      "id": "rag_generic",
+      "topic": "rag",
+      "text": "在资料库里检索 warranty 或 保修，返回最相关的一条要点。",
+      "must_any": ["保修", "warranty", "Warranty"]
+    },
+    {
+      "id": "qa_rag",
+      "topic": "qa",
+      "text": "用一句话解释什么是RAG。",
+      "must_any": ["检索", "向量", "资料", "知识库"]
+    },
+    {
+      "id": "finance_rate",
+      "topic": "finance",
+      "text": "USD to AUD 当前汇率是多少？给一个数字即可。",
+      "must_any": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    },
+    {
+      "id": "short_advice",
+      "topic": "advice",
+      "text": "给我一个今天出门穿衣建议（1-2句）。",
+      "must_any": ["建议", "穿", "外套", "带"]
+    }
+  ]
+}
+

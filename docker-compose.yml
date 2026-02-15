@@ -1,0 +1,113 @@
+services:
+  eval-report:
+    image: python:3.11-slim
+    container_name: eval-report
+    restart: unless-stopped
+    working_dir: /srv
+    command: ["python", "-m", "http.server", "19110", "--bind", "0.0.0.0", "--directory", "/srv/evaluation"]
+    volumes:
+      - ./evaluation:/srv/evaluation:ro
+    ports:
+      - "19110:19110"
+
+  openai-mcp-gateway:
+    env_file:
+      - .env.news_miniflux
+      - secrets/.env.mcp.secrets
+    build: .
+    container_name: openai-mcp-gateway
+    restart: unless-stopped
+    environment:
+      - PORT=19100
+      - TZ=Australia/Melbourne
+      - OPENAI_COMPAT_MODEL_ID=jarvis_mcp
+      - HA_BASE_URL=http://192.168.1.244:8123
+      - HA_TIMEOUT=20
+      - HA_DEFAULT_WEATHER_ENTITY=weather.doncaster_east
+      - HA_DEFAULT_WEATHER_ENTITY_HOURLY=weather.doncaster_east_hourly
+      - HA_DEFAULT_CALENDAR_ENTITY=calendar.family
+      - MINIFLUX_BASE_URL=${MINIFLUX_BASE_URL:-http://192.168.1.162:19091}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://192.168.1.162:11434}
+      - EMBED_MODEL=${EMBED_MODEL:-qwen3-embedding:0.6b}
+      - QDRANT_URL=${QDRANT_URL:-http://192.168.1.162:6333}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-ha_memory_qwen3}
+      - QDRANT_VECTOR_SIZE=${QDRANT_VECTOR_SIZE:-1024}
+      - SEARXNG_URL=${SEARXNG_URL:-http://192.168.1.162:8081}
+      - BRAVE_SEARCH_URL=${BRAVE_SEARCH_URL:-https://api.search.brave.com/res/v1/web/search}
+      - BRAVE_SEARCH_COUNTRY=${BRAVE_SEARCH_COUNTRY:-AU}
+      - POI_DEFAULT_QUERY_SUFFIX=${POI_DEFAULT_QUERY_SUFFIX:-Doncaster East VIC 319}
+    volumes:
+      - ./data:/app/data
+      - ./secrets/gmail:/app/secrets/gmail:ro
+      - /mnt/nas:/mnt/nas:ro
+      - /mnt/nas/Obsidian/VaultHome:/mnt/nas/Obsidian/VaultHome:rw
+    ports:
+      - "19100:19100"
+    command: ["python", "/app/openai_compat_gateway.py"]
+
+  mcp-hello:
+    env_file:
+      - .env.news_miniflux
+      - secrets/.env.mcp.secrets
+    build: .
+    container_name: mcp-hello
+    restart: unless-stopped
+    environment:
+      - PORT=19090
+      - TZ=Australia/Melbourne
+      - HA_BASE_URL=http://192.168.1.244:8123
+      - HA_DEFAULT_WEATHER_ENTITY=weather.forecast_home
+      - HA_DEFAULT_CALENDAR_ENTITY=calendar.family
+      - MINIFLUX_BASE_URL=${MINIFLUX_BASE_URL:-http://192.168.1.162:19091}
+      - MINIFLUX_LOOKBACK_HOURS=${MINIFLUX_LOOKBACK_HOURS:-24}
+      - MINIFLUX_DEFAULT_LIMIT=${MINIFLUX_DEFAULT_LIMIT:-5}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://192.168.1.162:11434}
+      - EMBED_MODEL=${EMBED_MODEL:-qwen3-embedding:0.6b}
+      - QDRANT_URL=${QDRANT_URL:-http://192.168.1.162:6333}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-ha_memory_qwen3}
+      - QDRANT_VECTOR_SIZE=${QDRANT_VECTOR_SIZE:-1024}
+      - NEWS_TRANSLATE_ENABLE=${NEWS_TRANSLATE_ENABLE:-1}
+      - NEWS_TRANSLATE_MODEL=${NEWS_TRANSLATE_MODEL:-qwen3:1.7b}
+      - NEWS_TRANSLATE_TIMEOUT_SEC=${NEWS_TRANSLATE_TIMEOUT_SEC:-12}
+      - NEWS_TRANSLATE_CACHE_TTL_SEC=${NEWS_TRANSLATE_CACHE_TTL_SEC:-86400}
+      - ROUTE_RETURN_DATA=0
+      - ROUTE_RETURN_TEXT=1
+      - NEWS_TRANSLATE_BUDGET_SEC=${NEWS_TRANSLATE_BUDGET_SEC:-60}
+      - NEWS_TRANSLATE_DISABLE=1
+      - ROUTER_LLM_ENABLE=0
+      - NEWS_QUERY_TRANSLATE_MODEL=qwen3-vl:2b
+      - NEWS_KEYWORD_MODEL=qwen3-vl:2b
+      - NEWS_CACHE_REFRESH_SEC=1800
+      - NEWS_CACHE_AI_PER_REFRESH=24
+      - NEWS_CACHE_FETCH_LIMIT=120
+      - HA_DEFAULT_MEDIA_PLAYER=media_player.living_room_speaker_2   # 换成你实际的播放器实体
+      - MUSIC_UNMUTE_DEFAULT=0.5
+      - HA_MEDIA_PLAYER_ALIASES=卧室:media_player.master_bedroom_speaker,主卧:media_player.master_bedroom_speaker,客厅:media_player.living_room_speaker_2
+      - HA_DEFAULT_WEATHER_ENTITY=weather.doncaster_east
+      - HA_DEFAULT_CALENDAR_ENTITY=calendar.family
+      - HA_DEFAULT_WEATHER_ENTITY_HOURLY=weather.doncaster_east_hourly
+      - SEARXNG_URL=${SEARXNG_URL:-http://192.168.1.162:8081}
+      - WEB_SEARCH_FALLBACK_MODE=${WEB_SEARCH_FALLBACK_MODE:-explicit}
+      - WEB_SEARCH_DEFAULT_LIMIT=${WEB_SEARCH_DEFAULT_LIMIT:-5}
+      - BRAVE_SEARCH_URL=${BRAVE_SEARCH_URL:-https://api.search.brave.com/res/v1/web/search}
+      - BRAVE_SEARCH_COUNTRY=${BRAVE_SEARCH_COUNTRY:-AU}
+      - BRAVE_SEARCH_TIMEOUT=${BRAVE_SEARCH_TIMEOUT:-8}
+      - BRAVE_SAFESEARCH=${BRAVE_SAFESEARCH:-moderate}
+      - BRAVE_EXTRA_SNIPPETS=${BRAVE_EXTRA_SNIPPETS:-true}
+      - BRAVE_MIN_INTERVAL=${BRAVE_MIN_INTERVAL:-1.2}
+      - BRAVE_MAX_RETRY_AFTER=${BRAVE_MAX_RETRY_AFTER:-6.0}
+      - WEB_SEARCH_MAX_SOURCES=${WEB_SEARCH_MAX_SOURCES:-2}
+      - WEB_SEARCH_INCLUDE_URLS=${WEB_SEARCH_INCLUDE_URLS:-false}
+      - WEB_SEARCH_SNIPPET_MAX=${WEB_SEARCH_SNIPPET_MAX:-180}
+      - POI_REGION=${POI_REGION:-AU}
+      - POI_LANG=${POI_LANG:-en}
+      - POI_MAX_RESULTS=${POI_MAX_RESULTS:-3}
+      - POI_DEFAULT_QUERY_SUFFIX=${POI_DEFAULT_QUERY_SUFFIX:-Doncaster East VIC 319}
+      - POI_CACHE_TTL_SECONDS=${POI_CACHE_TTL_SECONDS:-86400}
+    volumes:
+      - ./data:/app/data
+      - ./secrets/gmail:/app/secrets/gmail:ro
+      - /mnt/nas:/mnt/nas:ro
+      - /mnt/nas/Obsidian/VaultHome:/mnt/nas/Obsidian/VaultHome:rw
+    ports:
+      - "19090:19090"

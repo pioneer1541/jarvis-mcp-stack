@@ -1,0 +1,52 @@
+.venv/
+.venv_*/
+__pycache__/
+*.pyc
+
+# Editor/backup files
+*.bak*
+*.bad*
+*~
+
+# IDE / local tooling
+.vscode/
+.codex/
+
+# Environment files (commit only *.example)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+data/
+logs/
+
+# Secrets (keep docs + templates, ignore real secrets)
+secrets/*
+!secrets/README.md
+!secrets/*.example
+secrets/gmail/
+
+# Workspace scratch
+/tmp/
+
+# Large/volatile eval artifacts
+evaluation/history/
+
+# Private/local evaluation datasets + generated reports (do not commit)
+evaluation/daily100_report.json
+evaluation/bilingual50_cases.json
+evaluation/ha_smoke10_cases.json
+evaluation/*_report.*
+evaluation/*_eval_*.json
+evaluation/*_eval_*.html
+evaluation/_tmp_*.json
+evaluation/_tmp_*.html
+evaluation/latest_report.json
+evaluation/source_stability_report.json
+evaluation/news*_eval*.json
+
+# Keep example datasets / templates committed
+!evaluation/*.example.json
+!evaluation/*.example.html
+!evaluation/*.example.md

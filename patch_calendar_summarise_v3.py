@@ -1,0 +1,127 @@
+import re
+
+p = "app.py"
+s = open(p, "r", encoding="utf-8").read()
+
+# 定位 route_request 函数范围（避免误替换）
+m_fn = re.search(r"(?ms)^[ \t]*def[ \t]+route_request\([^\)]*\)[ \t]*->[ \t]*dict[ \t]*:\n", s)
+if not m_fn:
+    raise RuntimeError("cannot find def route_request")
+
+fn_start = m_fn.start()
+# 找到 route_request 之后的下一个顶层 def 作为函数结束（或文件末尾）
+m_next = re.search(r"(?m)^[ \t]*def[ \t]+\w+\b", s[m_fn.end():])
+fn_end = len(s) if not m_next else (m_fn.end() + m_next.start())
+fn = s[fn_start:fn_end]
+
+# 找 structured_calendar 分支行
+m_cal = re.search(r"(?m)^([ \t]*)(if|elif)[ \t]+rt[ \t]*==[ \t]*['\"]structured_calendar['\"][ \t]*:[ \t]*$", fn)
+if not m_cal:
+    raise RuntimeError("cannot find structured_calendar branch inside route_request")
+
+indent = m_cal.group(1)
+cal_start = m_cal.start()
+
+# 找 structured_state 分支行（在 calendar 之后）
+m_state = re.search(r"(?m)^" + re.escape(indent) + r"(if|elif)[ \t]+rt[ \t]*==[ \t]*['\"]structured_state['\"][ \t]*:[ \t]*$", fn[m_cal.end():])
+if not m_state:
+    # 放宽：允许不同缩进
+    m_state2 = re.search(r"(?m)^[ \t]*(if|elif)[ \t]+rt[ \t]*==[ \t]*['\"]structured_state['\"][ \t]*:[ \t]*$", fn[m_cal.end():])
+    if not m_state2:
+        raise RuntimeError("cannot find structured_state branch after structured_calendar")
+    cal_end = m_cal.end() + m_state2.start()
+else:
+    cal_end = m_cal.end() + m_state.start()
+
+# 构造新 calendar 分支（注意：首行无括号）
+lines = []
+lines.append(indent + 'if rt == "structured_calendar":')
+lines.append(indent + '    default_cal = os.getenv("HA_DEFAULT_CALENDAR_ENTITY", "") or ""')
+lines.append(indent + '    if not default_cal:')
+lines.append(indent + '        return {')
+lines.append(indent + '            "ok": True,')
+lines.append(indent + '            "route_type": rt,')
+lines.append(indent + '            "final": "未配置默认日程实体。请设置环境变量 HA_DEFAULT_CALENDAR_ENTITY，或直接用 ha_calendar_events(entity_id,start,end) 调用。",')
+lines.append(indent + '            "error": "missing_default_calendar_entity",')
+lines.append(indent + '        }')
+lines.append("")
+lines.append(indent + '    rng = _calendar_range_from_text(user_text)')
+lines.append(indent + '    r = ha_calendar_events(default_cal, rng.get("start") or "", rng.get("end") or "", 12)')
+lines.append(indent + '    if not r.get("ok"):')
+lines.append(indent + '        return {"ok": True, "route_type": rt, "final": "无法获取日程。", "data": r, "entity_id": default_cal}')
+lines.append("")
+lines.append(indent + '    items = r.get("data") or []')
+lines.append(indent + '    if not isinstance(items, list):')
+lines.append(indent + '        items = []')
+lines.append("")
+lines.append(indent + '    label = ""')
+lines.append(indent + '    try:')
+lines.append(indent + '        start_date = str(rng.get("start") or "")[:10]')
+lines.append(indent + '        now_d = _now_local().date()')
+lines.append(indent + '        if start_date:')
+lines.append(indent + '            y = int(start_date[0:4]); mo = int(start_date[5:7]); da = int(start_date[8:10])')
+lines.append(indent + '            sd = date(y, mo, da)')
+lines.append(indent + '            if sd == now_d:')
+lines.append(indent + '                label = "今天"')
+lines.append(indent + '            elif sd == (now_d + timedelta(days=1)):')
+lines.append(indent + '                label = "明天"')
+lines.append(indent + '            else:')
+lines.append(indent + '                label = start_date')
+lines.append(indent + '    except Exception:')
+lines.append(indent + '        label = ""')
+lines.append("")
+lines.append(indent + '    n = len(items)')
+lines.append(indent + '    if n == 0:')
+lines.append(indent + '        final = (label + "没有日程。") if label else "没有日程。"')
+lines.append(indent + '        return {"ok": True, "route_type": rt, "final": final, "data": r, "range": rng}')
+lines.append("")
+lines.append(indent + '    def _fmt_time(ev: dict) -> str:')
+lines.append(indent + '        try:')
+lines.append(indent + '            st = ev.get("start") or {}')
+lines.append(indent + '            if isinstance(st, dict) and ("dateTime" in st) and st.get("dateTime"):')
+lines.append(indent + '                dt = datetime.fromisoformat(str(st.get("dateTime")))')
+lines.append(indent + '                try:')
+lines.append(indent + '                    dt = dt.astimezone(ZoneInfo(_tz_name()))')
+lines.append(indent + '                except Exception:')
+lines.append(indent + '                    pass')
+lines.append(indent + '                return dt.strftime("%H:%M")')
+lines.append(indent + '            if isinstance(st, dict) and ("date" in st) and st.get("date"):')
+lines.append(indent + '                return "全天"')
+lines.append(indent + '        except Exception:')
+lines.append(indent + '            pass')
+lines.append(indent + '        return ""')
+lines.append("")
+lines.append(indent + '    lines_out = []')
+lines.append(indent + '    for ev in items[:3]:')
+lines.append(indent + '        if not isinstance(ev, dict):')
+lines.append(indent + '            continue')
+lines.append(indent + '        t = _fmt_time(ev)')
+lines.append(indent + '        title = str(ev.get("summary") or "").strip()')
+lines.append(indent + '        loc = str(ev.get("location") or "").strip()')
+lines.append(indent + '        if not title:')
+lines.append(indent + '            title = "（未命名日程）"')
+lines.append(indent + '        if loc:')
+lines.append(indent + '            one = (t + " " + title + "（" + loc + "）").strip()')
+lines.append(indent + '        else:')
+lines.append(indent + '            one = (t + " " + title).strip()')
+lines.append(indent + '        lines_out.append(one)')
+lines.append("")
+lines.append(indent + '    if label:')
+lines.append(indent + '        prefix = label + "有 " + str(n) + " 条日程："')
+lines.append(indent + '    else:')
+lines.append(indent + '        prefix = "共有 " + str(n) + " 条日程："')
+lines.append("")
+lines.append(indent + '    final = prefix + "；".join(lines_out) + "。"')
+lines.append(indent + '    if n > 3:')
+lines.append(indent + '        final = final + "其余已省略。"')
+lines.append("")
+lines.append(indent + '    return {"ok": True, "route_type": rt, "final": final, "data": r, "range": rng}')
+lines.append("")
+
+new_cal = "\n".join(lines)
+
+fn2 = fn[:cal_start] + new_cal + fn[cal_end:]
+s2 = s[:fn_start] + fn2 + s[fn_end:]
+
+open(p, "w", encoding="utf-8").write(s2)
+print("patched_ok=1")
